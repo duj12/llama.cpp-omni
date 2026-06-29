@@ -29,6 +29,91 @@ class Token2WavSession;
 }
 }
 
+struct projector_hparams {
+    int32_t in_dim  = 4096;  // 输入维度 (LLM hidden size)
+    int32_t out_dim = 768;   // 输出维度 (TTS embedding size)
+};
+
+struct projector_layer {
+    struct ggml_tensor * linear1_weight = nullptr;  // [in_dim, out_dim]
+    struct ggml_tensor * linear1_bias   = nullptr;  // [out_dim]
+    struct ggml_tensor * linear2_weight = nullptr;  // [out_dim, out_dim]
+    struct ggml_tensor * linear2_bias   = nullptr;  // [out_dim]
+};
+
+struct projector_model {
+    projector_hparams hparams;
+    projector_layer layer;
+
+    struct ggml_context * ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_type_t buf_type = nullptr;
+    bool initialized = false;
+};
+
+//
+// Shared model state — loaded once at server startup, shared across sessions.
+//
+struct omni_shared_models {
+    // LLM model weights (shared)
+    llama_model * model = nullptr;
+
+    // TTS model weights (shared)
+    llama_model * model_tts = nullptr;
+
+    // Vision encoder (shared, mutex protected)
+    vision_ctx * ctx_vision = nullptr;
+
+    // Audio encoder (shared, mutex protected)
+    audition_ctx * ctx_audio = nullptr;
+
+    // TTS weight buffers loaded from GGUF (shared)
+    float * emb_code_weight = nullptr;
+    int emb_code_vocab_size = 0;
+    int emb_code_hidden_size = 0;
+    bool emb_code_stored_as_transposed = false;
+    float * emb_text_weight = nullptr;
+    int emb_text_vocab_size = 0;
+    int emb_text_hidden_size = 0;
+    float * projector_semantic_linear1_weight = nullptr;
+    float * projector_semantic_linear1_bias = nullptr;
+    float * projector_semantic_linear2_weight = nullptr;
+    float * projector_semantic_linear2_bias = nullptr;
+    int projector_semantic_input_dim = 0;
+    int projector_semantic_output_dim = 0;
+    struct projector_model projector;
+    float * head_code_weight = nullptr;
+    int head_code_hidden_size = 0;
+    int head_code_num_audio_tokens = 0;
+
+    // TTS condition graph state (shared)
+    struct tts_condition_graph_model tts_condition_graph;
+
+    // Token2Wav (shared)
+    std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
+    bool token2wav_initialized = false;
+    std::string token2wav_model_dir;
+
+    // Python token2wav process (shared)
+    bool use_python_token2wav = false;
+    FILE* python_t2w_stdin = nullptr;
+    FILE* python_t2w_stdout = nullptr;
+    pid_t python_t2w_pid = -1;
+    bool python_t2w_initialized = false;
+    std::string python_t2w_gpu_id;
+    std::string python_t2w_dedicated_gpu = "";
+
+    // Vision batch encode flag
+    bool vpm_batch_encode = false;
+    std::string coreml_model_path;
+
+    // Protects shared encoder access (vision/audio encoding calls are not thread-safe)
+    std::mutex encode_mtx;
+
+    ~omni_shared_models();
+};
+
 // 🔧 [Duplex Pipeline] 仅在 duplex_mode=true 时分配；
 // 定义在 omni.cpp 的 "===== DUPLEX PIPELINE (Stage 1) =====" 区域，
 // omni_context 只持有指针，simplex 路径不受影响。
@@ -125,29 +210,6 @@ struct UnitEntry {
     int turn_id = 0;
 };
 
-struct projector_hparams {
-    int32_t in_dim  = 4096;  // 输入维度 (LLM hidden size)
-    int32_t out_dim = 768;   // 输出维度 (TTS embedding size)
-};
-
-struct projector_layer {
-    struct ggml_tensor * linear1_weight = nullptr;  // [in_dim, out_dim]
-    struct ggml_tensor * linear1_bias   = nullptr;  // [out_dim]
-    struct ggml_tensor * linear2_weight = nullptr;  // [out_dim, out_dim]
-    struct ggml_tensor * linear2_bias   = nullptr;  // [out_dim]
-};
-
-struct projector_model {
-    projector_hparams hparams;
-    projector_layer layer;
-    
-    struct ggml_context * ctx_w = nullptr;
-    ggml_backend_buffer_t buf_w = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_type_t buf_type = nullptr;
-    bool initialized = false;
-};
-
 // ============================================================================
 // Audio output callback type
 // Called by T2W threads when a chunk of audio is generated.
@@ -170,6 +232,19 @@ struct omni_context {
     // true: omni_init 内部加载的模型，omni_free 时需要释放
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
+
+    // 🔧 [多会话共享] 指向共享模型/编码器状态的指针。
+    // 当此指针非空时，ctx_vision、ctx_audio、model、model_tts 及所有 TTS
+    // weight 缓冲区均从 shared 结构借用，omni_free 不会释放这些资源。
+    struct omni_shared_models * shared = nullptr;
+
+    // Per-resource ownership flags for shared mode.
+    // When shared != nullptr, these are set to false so omni_free skips them.
+    bool owns_vision = true;
+    bool owns_audio = true;
+    bool owns_tts_model = true;
+    bool owns_tts_weights = true;
+    bool owns_token2wav = true;
 
     // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
@@ -488,9 +563,18 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output");
+                                const std::string & base_output_dir = "./tools/omni/output",
+                                struct omni_shared_models * shared = nullptr);
 
 void omni_free(struct omni_context * ctx_omni);
+
+// Allocate and load all shared models from params. Call once at server startup.
+// Returns nullptr on failure.
+struct omni_shared_models * omni_shared_init(struct common_params * params, const std::string & tts_bin_dir,
+                                             int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0");
+
+// Free all shared models. Safe to call with nullptr.
+void omni_shared_free(struct omni_shared_models * shared);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);

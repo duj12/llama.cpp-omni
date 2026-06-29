@@ -164,70 +164,6 @@ static void clear_text_stream_state(omni_context * octx) {
     octx->text_streaming = false;
 }
 
-static void stop_reusable_octx_threads(omni_context * octx) {
-    omni_prepare_for_reuse(octx);
-}
-
-// Wipe per-session state on a reused context: stop threads, reset counters/flags,
-// clear LLM/TTS/whisper KV caches, so the next session starts clean on the same
-// loaded model. Used by the shared-octx reuse path in create_session_octx.
-static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
-                                   const std::string & output_dir) {
-    stop_reusable_octx_threads(octx);
-
-    const bool duplex_mode = (init.mode == "full_duplex");
-    octx->async = true;
-    octx->duplex_mode = duplex_mode;
-    octx->base_output_dir = output_dir;
-
-    octx->break_event.store(false);
-    octx->current_turn_ended = false;
-    octx->llm_generation_done = false;
-    octx->need_speek = false;
-    octx->speek_done = true;
-
-    octx->n_past = 0;
-    octx->n_keep = 0;
-    octx->system_prompt_initialized = false;
-    octx->simplex_round_idx = 0;
-    octx->wav_turn_base = 0;
-    octx->round_start_positions.clear();
-    octx->force_listen_used = 0;
-
-    octx->tts_all_generated_tokens.clear();
-    octx->tts_token_buffer.clear();
-    octx->tts_n_past_accumulated = 0;
-    octx->tts_condition_saved = false;
-    octx->tts_condition_embeddings.clear();
-    octx->tts_condition_length = 0;
-    octx->tts_condition_n_embd = 0;
-
-    clear_text_stream_state(octx);
-
-    if (octx->ctx_llama) {
-        llama_memory_t mem = llama_get_memory(octx->ctx_llama);
-        if (mem) {
-            llama_memory_clear(mem, /*data=*/false);
-        }
-    }
-    if (octx->ctx_tts_llama) {
-        llama_memory_t mem = llama_get_memory(octx->ctx_tts_llama);
-        if (mem) {
-            llama_memory_clear(mem, /*data=*/false);
-        }
-    }
-    if (octx->ctx_audio) {
-        audition_whisper_clear_kv_cache(octx->ctx_audio);
-    }
-    if (octx->ctx_vision) {
-        vision_set_max_slice_nums(octx->ctx_vision, -1);
-    }
-
-    if (!init.system_prompt.empty()) {
-        octx->omni_assistant_prompt = init.system_prompt;
-    }
-}
-
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
 // context and params. Unknown/missing keys are left at model defaults.
 static void apply_session_config(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
@@ -518,8 +454,7 @@ static void configure_turn_based_prompt(omni_context * octx,
 // ============================================================================
 
 static omni_context * create_session_octx(common_params & params, const ParsedSessionInit & init,
-                                          llama_model * model, llama_context * ctx,
-                                          omni_context *& shared_octx,
+                                          omni_shared_models * shared,
                                           const std::string & output_dir) {
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
@@ -530,24 +465,12 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     p.n_predict = 2048;
     ensure_omni_model_paths(p);
 
-    // Reuse the server-owned context if it matches this session's mode (avoids
-    // reloading the model); otherwise tear it down and build a fresh one.
-    if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
-        reset_octx_for_session(shared_octx, init, output_dir);
-        apply_session_config(p, shared_octx, init);
-        LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
-                duplex_mode, output_dir.c_str());
-        return shared_octx;
-    }
-
-    if (shared_octx) {
-        omni_free(shared_octx);
-        shared_octx = nullptr;
-    }
-
+    // Create a NEW per-session omni_context using shared models.
+    // Pass shared->model as existing_model (triggers the "shared model, new context" path).
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
                                      /*token2wav_device*/"gpu:0", duplex_mode,
-                                     model, ctx, output_dir);
+                                     shared->model, /*existing_ctx*/nullptr, output_dir,
+                                     shared);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;
@@ -561,9 +484,8 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
     }
-    shared_octx = octx;
 
-    LOG_INF("create_session_octx: session octx created, duplex=%d, output_dir=%s\n",
+    LOG_INF("create_session_octx: per-session octx created, duplex=%d, output_dir=%s\n",
             duplex_mode, output_dir.c_str());
     return octx;
 }
@@ -575,10 +497,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
 void handle_ws_backend(httplib::ws::WebSocket & ws,
                         SessionManager & session_mgr,
                         common_params & params_base,
-                        llama_model * model,
-                        llama_context * ctx,
-                        omni_context *& shared_octx,
-                        std::mutex & octx_mutex) {
+                        omni_shared_models * shared) {
     const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
@@ -635,26 +554,31 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     // ================================================================
     std::string session_id = session_mgr.allocate();
     if (session_id.empty()) {
-        // Already an active session
-        LOG_ERR("WS /backend: session.init rejected — active session exists\n");
+        // Max concurrent sessions reached
+        LOG_ERR("WS /backend: session.init rejected — max concurrent sessions (%d) reached\n",
+                session_mgr.active_count());
         ws.close();
         return;
     }
 
     std::string session_output_dir = (fs::path(temp_dir) / session_id).string();
 
-    omni_context * octx = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        octx = create_session_octx(params_base, parsed_init, model, ctx, shared_octx, session_output_dir);
-    }
+    // Create per-session octx using shared models
+    omni_context * octx = create_session_octx(params_base, parsed_init, shared, session_output_dir);
     if (!octx) {
         fail_fast(session_id, "omni_init_failed");
         return;
     }
 
-    // Full-duplex requires index=0 prefill before the first frame. This
-    // initializes the system prompt and starts the duplex encoder/LLM pipeline.
+    // Activate session immediately so cleanup paths can free octx correctly.
+    if (!session_mgr.activate(session_id, octx, /*owns_octx*/true)) {
+        LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
+        fail_fast(session_id, "activate_failed");
+        return;
+    }
+
+    // Full-duplex requires index=0 prefill before the first frame.
+    // Lock the shared encoder mutex for vision/audio encoding.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
         std::string voice_wav;
         if (!parsed_init.ref_audio_b64.empty()) {
@@ -664,12 +588,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             fail_fast(session_id, "voice_audio_decode_failed");
             return;
         }
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
-            LOG_ERR("WS /backend: voice prefill failed\n");
-            if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "voice_prefill_failed");
-            return;
+        {
+            std::lock_guard<std::mutex> lock(shared->encode_mtx);
+            if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
+                LOG_ERR("WS /backend: voice prefill failed\n");
+                if (!voice_wav.empty()) fs::remove(voice_wav);
+                fail_fast(session_id, "voice_prefill_failed");
+                return;
+            }
         }
         if (!voice_wav.empty()) fs::remove(voice_wav);
         if (octx->llm_thread_info) {
@@ -677,21 +603,13 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         }
     }
 
-    // Activate session
-    {
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!session_mgr.activate(session_id, octx, /*owns_octx*/false)) {
-            LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
-            fail_fast(session_id, "activate_failed");
-            return;
-        }
-        session_mgr.set_close_callback(session_id, [&ws, session_id]() {
-            // Preserve protocol ordering for older runtimes: emit session.closed
-            // before the transport close wakes a blocked ws.read().
-            ws.send(make_session_closed(session_id, "client_closed").dump());
-            ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
-        });
-    }
+    // Set close callback
+    session_mgr.set_close_callback(session_id, [&ws, session_id]() {
+        // Preserve protocol ordering for older runtimes: emit session.closed
+        // before the transport close wakes a blocked ws.read().
+        ws.send(make_session_closed(session_id, "client_closed").dump());
+        ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
+    });
 
     // Send session.created
     send_event(make_session_created(session_id, parsed_init.mode, make_runtime_metrics(octx)));
@@ -888,7 +806,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Prefill with text + audio + image/video frames
             {
                 const auto t_prefill_start = std::chrono::steady_clock::now();
-                std::lock_guard<std::mutex> lock(octx_mutex);
+                std::lock_guard<std::mutex> lock(shared->encode_mtx);
                 if (octx->params) {
                     octx->params->n_predict = parsed_input.max_new_tokens;
                 }
@@ -1102,7 +1020,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Prefill
             {
                 const auto t_prefill_start = std::chrono::steady_clock::now();
-                std::lock_guard<std::mutex> lock(octx_mutex);
+                std::lock_guard<std::mutex> lock(shared->encode_mtx);
                 if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
                                     input_index, parsed_input.max_slice_nums)) {
                     tmp_files.cleanup();
@@ -1250,11 +1168,9 @@ cleanup:
     std::string close_ev = make_session_closed(session_id, "client_disconnected").dump();
     ws.send(close_ev);
 
-    // On disconnect, stop inference and recycle the shared context (via
-    // omni_prepare_for_reuse) rather than freeing it — the model stays loaded
-    // for the next session. Then drop the session and clean up temp media.
+    // On disconnect, signal break and close the session.
+    // session_mgr.close will free the per-session octx via omni_free.
     {
-        std::lock_guard<std::mutex> lock(octx_mutex);
         OmniSession * session = session_mgr.get(session_id);
         if (session && session->octx) {
             session->octx->break_event = true;
@@ -1264,7 +1180,6 @@ cleanup:
                 session->octx->text_done_flag = true;
             }
             session->octx->text_cv.notify_all();
-            omni_prepare_for_reuse(session->octx);
         }
         session_mgr.close(session_id);
     }

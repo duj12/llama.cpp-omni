@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <functional>
+#include <unordered_map>
 
 struct omni_context;
 
@@ -29,14 +30,15 @@ struct OmniSession {
     std::function<void()> close_ws;
 };
 
-// SessionManager — manages the single active backend session.
-// Protocol constraint: at most one active session per backend.
+// SessionManager — manages multiple concurrent backend sessions.
+// Default max_sessions = 4.
 class SessionManager {
 public:
+    SessionManager(int max_sessions = 4);
     ~SessionManager();
 
     // Allocate a new session (UNINITIALIZED state). Returns session_id.
-    // Fails if an active session already exists.
+    // Returns empty string if max_sessions reached.
     std::string allocate();
 
     // Activate a session after successful init. Sets octx pointer.
@@ -53,17 +55,18 @@ public:
     // Close and forget a session. Releases omni_context if owned.
     void close(const std::string & session_id);
 
-    // Handle WS disconnect — auto-close active session.
+    // Handle WS disconnect — close all sessions with expired WS.
     void on_disconnect();
 
-    // Check if an active session exists.
-    bool has_active() const;
+    // Number of active sessions.
+    int active_count() const;
 
     // Close all sessions (shutdown cleanup).
     void shutdown();
 
 private:
     mutable std::mutex mtx_;
-    std::unique_ptr<OmniSession> active_;
+    std::unordered_map<std::string, std::unique_ptr<OmniSession>> sessions_;
+    int max_sessions_ = 4;
     std::string generate_uuid();
 };

@@ -6,6 +6,9 @@
 #include <iomanip>
 #include <chrono>
 
+SessionManager::SessionManager(int max_sessions)
+    : max_sessions_(max_sessions) {}
+
 SessionManager::~SessionManager() {
     shutdown();
 }
@@ -34,8 +37,15 @@ std::string SessionManager::generate_uuid() {
 std::string SessionManager::allocate() {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (active_ && active_->state != SessionState::CLOSED) {
-        return ""; // fail-fast: only one active session
+    // Count active sessions (exclude CLOSED)
+    int active = 0;
+    for (const auto & [id, s] : sessions_) {
+        if (s->state != SessionState::CLOSED) {
+            active++;
+        }
+    }
+    if (active >= max_sessions_) {
+        return ""; // max concurrent sessions reached
     }
 
     auto session = std::make_unique<OmniSession>();
@@ -44,52 +54,56 @@ std::string SessionManager::allocate() {
     session->created_at = now_seconds();
 
     std::string id = session->session_id;
-    active_ = std::move(session);
+    sessions_[id] = std::move(session);
     return id;
 }
 
 bool SessionManager::activate(const std::string & session_id, omni_context * octx, bool owns_octx) {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (!active_ || active_->session_id != session_id) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
         return false;
     }
-    if (active_->state != SessionState::UNINITIALIZED) {
+    if (it->second->state != SessionState::UNINITIALIZED) {
         return false; // already active or closed
     }
 
-    active_->octx = octx;
-    active_->owns_octx = owns_octx;
-    active_->state = SessionState::ACTIVE;
+    it->second->octx = octx;
+    it->second->owns_octx = owns_octx;
+    it->second->state = SessionState::ACTIVE;
     return true;
 }
 
 OmniSession * SessionManager::get(const std::string & session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (!active_ || active_->session_id != session_id) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
         return nullptr;
     }
-    return active_.get();
+    return it->second.get();
 }
 
 void SessionManager::set_close_callback(const std::string & session_id, std::function<void()> cb) {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (!active_ || active_->session_id != session_id) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
         return;
     }
-    active_->close_ws = std::move(cb);
+    it->second->close_ws = std::move(cb);
 }
 
 void SessionManager::request_transport_close(const std::string & session_id) {
     std::function<void()> close_ws;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        if (!active_ || active_->session_id != session_id) {
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
             return;
         }
-        close_ws = active_->close_ws;
+        close_ws = it->second->close_ws;
     }
 
     if (close_ws) {
@@ -102,15 +116,17 @@ void SessionManager::close(const std::string & session_id) {
     {
         std::lock_guard<std::mutex> lock(mtx_);
 
-        if (!active_ || active_->session_id != session_id) {
-            return; // not found — caller gets 404
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            return; // not found
         }
 
-        if (active_->state == SessionState::ACTIVE) {
-            active_->state = SessionState::CLOSED;
+        if (it->second->state == SessionState::ACTIVE) {
+            it->second->state = SessionState::CLOSED;
         }
 
-        to_free = std::move(active_);
+        to_free = std::move(it->second);
+        sessions_.erase(it);
     }
 
     // Release omni_context outside the manager lock. omni_free stops and joins
@@ -123,37 +139,39 @@ void SessionManager::close(const std::string & session_id) {
 }
 
 void SessionManager::on_disconnect() {
-    std::unique_ptr<OmniSession> to_free;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-
-        if (!active_ || active_->state == SessionState::CLOSED) {
-            return;
-        }
-
-        active_->state = SessionState::CLOSED;
-        to_free = std::move(active_);
-    }
-
-    if (to_free && to_free->owns_octx && to_free->octx) {
-        omni_free(to_free->octx);
-        to_free->octx = nullptr;
-    }
+    // Not used in multi-session architecture: WS disconnect cleanup is handled
+    // directly in handle_ws_backend via session_mgr.close(session_id).
+    // This is a no-op stub retained for API compatibility.
 }
 
-bool SessionManager::has_active() const {
+int SessionManager::active_count() const {
     std::lock_guard<std::mutex> lock(mtx_);
-    return active_ && active_->state == SessionState::ACTIVE;
+    int count = 0;
+    for (const auto & [id, s] : sessions_) {
+        if (s->state == SessionState::ACTIVE) {
+            count++;
+        }
+    }
+    return count;
 }
 
 void SessionManager::shutdown() {
-    std::unique_ptr<OmniSession> to_free;
+    std::vector<std::unique_ptr<OmniSession>> to_free_list;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        to_free = std::move(active_);
+        for (auto & [id, s] : sessions_) {
+            if (s->state != SessionState::CLOSED) {
+                s->state = SessionState::CLOSED;
+            }
+            to_free_list.push_back(std::move(s));
+        }
+        sessions_.clear();
     }
 
-    if (to_free && to_free->owns_octx && to_free->octx) {
-        omni_free(to_free->octx);
+    for (auto & to_free : to_free_list) {
+        if (to_free && to_free->owns_octx && to_free->octx) {
+            omni_free(to_free->octx);
+            to_free->octx = nullptr;
+        }
     }
 }

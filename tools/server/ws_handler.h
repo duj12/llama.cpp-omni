@@ -7,9 +7,8 @@
 #include <mutex>
 
 struct omni_context;
+struct omni_shared_models;
 struct common_params;
-struct llama_model;
-struct llama_context;
 class SessionManager;
 
 namespace httplib {
@@ -17,16 +16,13 @@ namespace ws { class WebSocket; }
 }
 
 // ============================================================================
-// WS /backend handler — main entry point called from server.cpp
+// WS /backend handler — main entry point called from server-omni.cpp
 // ============================================================================
 
 void handle_ws_backend(httplib::ws::WebSocket & ws,
                        SessionManager & session_mgr,
                        common_params & params_base,
-                       llama_model * model,
-                       llama_context * ctx,
-                       omni_context *& shared_octx,  // server-owned, reused across sessions
-                       std::mutex & octx_mutex);
+                       omni_shared_models * shared);  // shared models, loaded once at startup
 
 // ============================================================================
 // Helpers: base64 audio/JPEG → temp files

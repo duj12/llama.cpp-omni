@@ -1611,9 +1611,16 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
 
 // Load TTS weights from GGUF file
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
+    // Note: fflush is handled inside print_with_timestamp
 
     auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
-        ggml_get_type_traits(t->type)->to_float(t->data, dst, n);
+        auto * traits = ggml_get_type_traits(t->type);
+        if (traits->to_float) {
+            traits->to_float(t->data, dst, n);
+        } else {
+            // No conversion needed (e.g., F32) — memcpy directly
+            memcpy(dst, t->data, n * sizeof(float));
+        }
     };
 
     // Initialize GGUF context
@@ -1622,13 +1629,14 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
         /*.no_alloc = */ false,
         /*.ctx      = */ &ctx_meta,
     };
-    
+
     struct gguf_context * ctx_gguf = gguf_init_from_file(tts_model_path, params);
     if (!ctx_gguf) {
         LOG_ERR("TTS: Failed to load GGUF file: %s\n", tts_model_path);
         return false;
     }
-    
+    print_with_timestamp("=== load_tts_weights_from_gguf: GGUF file opened\n");
+
     // Load emb_code.0.weight: (num_audio_tokens=6562, hidden_size=768)
     // This is used to convert audio token IDs to embeddings during decode phase
     const char * emb_code_name = "emb_code.0.weight";
@@ -1673,7 +1681,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             // Copy/convert tensor data based on type
             enum ggml_type emb_code_type = emb_code_tensor->type;
             int64_t emb_code_elements = dim0 * dim1;
-            
+
             ggml_tensor_to_f32(emb_code_tensor, ctx_omni->emb_code_weight, dim0 * dim1);
             
             ctx_omni->emb_code_vocab_size = num_audio_tokens;  // 6562
@@ -3966,6 +3974,7 @@ void print_with_timestamp(const char* format, ...)
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
+    fflush(stdout); // ensure output is visible even on crash
 }
 
 static struct llama_model * llama_init(common_params * params, std::string model_path) {
@@ -4006,7 +4015,8 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
-                                const std::string & base_output_dir) {
+                                const std::string & base_output_dir,
+                                struct omni_shared_models * shared) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -4075,12 +4085,33 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     llama_context * ctx_llama = nullptr;
     
     // 支持模型复用（单工模式常用）
-    if (existing_model != nullptr && existing_ctx != nullptr) {
+    if (shared != nullptr) {
+        // "共享模型、独立上下文"路径：模型已由 omni_shared_init 加载，
+        // 此处为每个 session 创建独立的 llama_context（新 KV cache）。
+        print_with_timestamp("=== omni_init: creating per-session context from shared model\n");
+        model = shared->model;
+        ctx_omni->owns_model = false;
+        ctx_omni->shared = shared;
+        ctx_omni->owns_vision = false;
+        ctx_omni->owns_audio = false;
+        ctx_omni->owns_tts_model = false;
+        ctx_omni->owns_tts_weights = false;
+        ctx_omni->owns_token2wav = false;
+
+        llama_context_params ctx_params = common_context_params_to_llama(*params);
+        ctx_params.n_ctx = params->n_ctx;
+        ctx_llama = llama_new_context_with_model(model, ctx_params);
+        if (ctx_llama == NULL) {
+            LOG_ERR("%s: error: failed to create per-session llama_context\n", __func__);
+            return NULL;
+        }
+        print_with_timestamp("=== omni_init: per-session ctx_llama created (n_ctx=%u)\n", ctx_params.n_ctx);
+    } else if (existing_model != nullptr && existing_ctx != nullptr) {
         print_with_timestamp("=== omni_init: reusing existing LLM model and context\n");
         model = existing_model;
         ctx_llama = existing_ctx;
         ctx_omni->owns_model = false;  // 不拥有模型，omni_free 时不释放
-        
+
         // 🔧 [模式切换修复] 清理 LLM 的 KV cache，避免位置冲突
         // 当从一个模式切换到另一个模式时，需要清理旧的 KV cache
         //
@@ -4106,7 +4137,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         }
         llama_context_params ctx_params = common_context_params_to_llama(*params);
         ctx_params.n_ctx                = params->n_ctx;
-        
+
         ctx_llama = llama_new_context_with_model(model, ctx_params);
         if (ctx_llama == NULL) {
             LOG_ERR("%s: error: failed to create the llama_context\n" , __func__);
@@ -4121,124 +4152,188 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->ctx_sampler = sampler;
 
     if (use_tts && !params->tts_model.empty()) {
-        print_with_timestamp("=== omni_init: loading TTS model\n");
-        // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
-        // tts_gpu_layers 从 omni_init 参数传入，-1 表示使用与LLM相同的设置
-        print_with_timestamp("TTS model: loading with n_gpu_layers=%d\n", tts_gpu_layers);
-        llama_model * tts_model = llama_init_tts(params, params->tts_model, tts_gpu_layers);
-        if (tts_model == NULL) {
-            LOG_ERR("%s: error: failed to init TTS model from %s\n", __func__, params->tts_model.c_str());
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
-            delete ctx_omni;
-            return NULL;
-        }
-        
-        // TTS 模型使用独立的上下文参数
-        // 注意：TTS 模型可能需要不同的上下文大小和批处理大小
-        llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
-        // 如果 TTS 模型需要更小的上下文窗口，可以在这里调整
-        // 例如：tts_ctx_params.n_ctx = std::min(params->n_ctx, 2048); // 限制 TTS 上下文大小
-        tts_ctx_params.n_ctx = params->n_ctx;  // 暂时使用相同的 n_ctx，后续可以根据需要调整
-        
-        llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
-        if (ctx_tts_llama == NULL) {
-            LOG_ERR("%s: error: failed to create the TTS llama_context\n", __func__);
-            llama_free_model(tts_model);
-            // 清理已分配的资源
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
-            delete ctx_omni;
-            return NULL;
-        }
-        
-        // 创建 TTS 的采样器
-        // 🔧 TTS流式采样参数 - 与 Python ras_sampling 对齐：
-        // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
-        common_params_sampling tts_sampling = params->sampling;
-        tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
-        tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
-        tts_sampling.top_k = 25;               // top_k = 25 (ras_sampling 参数)
-        tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
-        tts_sampling.min_p = 0.01f;            // min_p = 0.01
-        // Python: CustomRepetitionPenaltyLogitsProcessorRepeat(repetition_penalty, num_code, 16)
-        tts_sampling.penalty_last_n = 16;      // past_window = 16 (与Python对齐)
-        struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
-        print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n",
-                            tts_sampling.temp, tts_sampling.top_p, tts_sampling.top_k, tts_sampling.penalty_repeat);
-        
-        ctx_omni->model_tts = tts_model;
-        ctx_omni->ctx_tts_llama = ctx_tts_llama;
-        ctx_omni->ctx_tts_sampler = tts_sampler;
-        
-        // Load TTS weights from GGUF file
-        print_with_timestamp("TTS: loading weights from GGUF (emb_code, emb_text, projector_semantic, head_code)...\n");
-        if (!load_tts_weights_from_gguf(ctx_omni, params->tts_model.c_str())) {
-            LOG_ERR("%s: error: failed to load TTS weights from %s\n", __func__, params->tts_model.c_str());
-            llama_free(ctx_tts_llama);
-            llama_free_model(tts_model);
-            common_sampler_free(tts_sampler);
-            llama_free(ctx_llama);
-            llama_free_model(model);
-            common_sampler_free(sampler);
-            delete ctx_omni;
-            return NULL;
-        }
-        print_with_timestamp("TTS: weights loaded successfully\n");
-        
-        // Load Projector Semantic from GGUF file
-        // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
-        std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
-        print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
-        if (projector_init(ctx_omni->projector, projector_path, true)) {
-            print_with_timestamp("Projector: loaded successfully\n");
+        if (shared != nullptr) {
+            // Shared TTS model: create per-session context from shared model_tts.
+            // TTS weights and token2wav are already loaded in omni_shared_init.
+            print_with_timestamp("=== omni_init: creating per-session TTS context from shared model\n");
+            llama_model * tts_model = shared->model_tts;
+            if (tts_model == NULL) {
+                LOG_ERR("%s: shared TTS model is null\n", __func__);
+                llama_free(ctx_llama);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return NULL;
+            }
+
+            llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
+            tts_ctx_params.n_ctx = params->n_ctx;
+            llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
+            if (ctx_tts_llama == NULL) {
+                LOG_ERR("%s: error: failed to create per-session TTS llama_context\n", __func__);
+                llama_free(ctx_llama);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return NULL;
+            }
+
+            common_params_sampling tts_sampling = params->sampling;
+            tts_sampling.temp = ctx_omni->tts_temperature;
+            tts_sampling.top_p = 0.85f;
+            tts_sampling.top_k = 25;
+            tts_sampling.penalty_repeat = 1.05f;
+            tts_sampling.min_p = 0.01f;
+            tts_sampling.penalty_last_n = 16;
+            struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
+
+            ctx_omni->model_tts = tts_model;
+            ctx_omni->ctx_tts_llama = ctx_tts_llama;
+            ctx_omni->ctx_tts_sampler = tts_sampler;
+
+            // Borrow weight pointers from shared (we don't own them)
+            ctx_omni->emb_code_weight = shared->emb_code_weight;
+            ctx_omni->emb_code_vocab_size = shared->emb_code_vocab_size;
+            ctx_omni->emb_code_hidden_size = shared->emb_code_hidden_size;
+            ctx_omni->emb_code_stored_as_transposed = shared->emb_code_stored_as_transposed;
+            ctx_omni->emb_text_weight = shared->emb_text_weight;
+            ctx_omni->emb_text_vocab_size = shared->emb_text_vocab_size;
+            ctx_omni->emb_text_hidden_size = shared->emb_text_hidden_size;
+            ctx_omni->projector_semantic_linear1_weight = shared->projector_semantic_linear1_weight;
+            ctx_omni->projector_semantic_linear1_bias = shared->projector_semantic_linear1_bias;
+            ctx_omni->projector_semantic_linear2_weight = shared->projector_semantic_linear2_weight;
+            ctx_omni->projector_semantic_linear2_bias = shared->projector_semantic_linear2_bias;
+            ctx_omni->projector_semantic_input_dim = shared->projector_semantic_input_dim;
+            ctx_omni->projector_semantic_output_dim = shared->projector_semantic_output_dim;
+            ctx_omni->projector = shared->projector;
+            ctx_omni->head_code_weight = shared->head_code_weight;
+            ctx_omni->head_code_hidden_size = shared->head_code_hidden_size;
+            ctx_omni->head_code_num_audio_tokens = shared->head_code_num_audio_tokens;
+            ctx_omni->tts_condition_graph = shared->tts_condition_graph;
+
+            // Share token2wav session
+            ctx_omni->token2wav_session = std::move(shared->token2wav_session);
+            ctx_omni->token2wav_initialized = shared->token2wav_initialized;
+            ctx_omni->token2wav_model_dir = shared->token2wav_model_dir;
+            // Note: token2wav_session is moved out of shared for first session.
+            // Subsequent sessions create their own or use Python T2W.
         } else {
-            print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
+            // Non-shared path (original behavior)
+            print_with_timestamp("=== omni_init: loading TTS model\n");
+            // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
+            // tts_gpu_layers 从 omni_init 参数传入，-1 表示使用与LLM相同的设置
+            print_with_timestamp("TTS model: loading with n_gpu_layers=%d\n", tts_gpu_layers);
+            llama_model * tts_model = llama_init_tts(params, params->tts_model, tts_gpu_layers);
+            if (tts_model == NULL) {
+                LOG_ERR("%s: error: failed to init TTS model from %s\n", __func__, params->tts_model.c_str());
+                llama_free(ctx_llama);
+                llama_free_model(model);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return NULL;
+            }
+
+            // TTS 模型使用独立的上下文参数
+            llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
+            tts_ctx_params.n_ctx = params->n_ctx;
+
+            llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
+            if (ctx_tts_llama == NULL) {
+                LOG_ERR("%s: error: failed to create the TTS llama_context\n", __func__);
+                llama_free_model(tts_model);
+                llama_free(ctx_llama);
+                llama_free_model(model);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return NULL;
+            }
+
+            // 创建 TTS 的采样器
+            common_params_sampling tts_sampling = params->sampling;
+            tts_sampling.temp = ctx_omni->tts_temperature;
+            tts_sampling.top_p = 0.85f;
+            tts_sampling.top_k = 25;
+            tts_sampling.penalty_repeat = 1.05f;
+            tts_sampling.min_p = 0.01f;
+            tts_sampling.penalty_last_n = 16;
+            struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
+            print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n",
+                                tts_sampling.temp, tts_sampling.top_p, tts_sampling.top_k, tts_sampling.penalty_repeat);
+
+            ctx_omni->model_tts = tts_model;
+            ctx_omni->ctx_tts_llama = ctx_tts_llama;
+            ctx_omni->ctx_tts_sampler = tts_sampler;
+
+            // Load TTS weights from GGUF file
+            print_with_timestamp("TTS: loading weights from GGUF (emb_code, emb_text, projector_semantic, head_code)...\n");
+            if (!load_tts_weights_from_gguf(ctx_omni, params->tts_model.c_str())) {
+                LOG_ERR("%s: error: failed to load TTS weights from %s\n", __func__, params->tts_model.c_str());
+                llama_free(ctx_tts_llama);
+                llama_free_model(tts_model);
+                common_sampler_free(tts_sampler);
+                llama_free(ctx_llama);
+                llama_free_model(model);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return NULL;
+            }
+            print_with_timestamp("TTS: weights loaded successfully\n");
+
+            // Load Projector Semantic from GGUF file
+            std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
+            print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
+            if (projector_init(ctx_omni->projector, projector_path, true)) {
+                print_with_timestamp("Projector: loaded successfully\n");
+            } else {
+                print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
+            }
         }
     }
 
     ctx_omni->omni_emb.resize((64 + 10 + 1) * 4096); // temp fix for omni embed
     ctx_omni->audio_emb.resize((10 + 1) * 4096); // temp fix for audio embed
-    print_with_timestamp("=== omni_init: loading APM model\n");
-    if (params->apm_model.empty()) {
-        LOG_ERR("%s: error: apm_model path is empty\n", __func__);
-        if (ctx_omni->use_tts) {
-            llama_free(ctx_omni->ctx_tts_llama);
-            llama_free_model(ctx_omni->model_tts);
-            common_sampler_free(ctx_omni->ctx_tts_sampler);
-        }
-        llama_free(ctx_llama);
-        llama_free_model(model);
-        common_sampler_free(sampler);
-        delete ctx_omni;
-        return NULL;
-    }
-    ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
-    print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
-    if (ctx_omni->ctx_audio == nullptr) {
-        LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
-        // 清理 TTS 模型资源（如果已加载）
-        if (ctx_omni->use_tts) {
-            llama_free(ctx_omni->ctx_tts_llama);
-            llama_free_model(ctx_omni->model_tts);
-            common_sampler_free(ctx_omni->ctx_tts_sampler);
-        }
-        llama_free(ctx_llama);
-        llama_free_model(model);
-        common_sampler_free(sampler);
-        delete ctx_omni;
-        return NULL;
-    }
 
-    ctx_omni->n_past = 0;
-    
-    if (media_type == 2) {
-        LOG_INF("init vision....");
-        const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
-        ctx_omni->ctx_vision = ctx_vision;
+    if (shared != nullptr) {
+        // Use shared audio/vision encoders
+        ctx_omni->ctx_audio = shared->ctx_audio;
+        ctx_omni->ctx_vision = shared->ctx_vision;
+        LOG_INF("=== omni_init: using shared audio/vision encoders\n");
+    } else {
+        print_with_timestamp("=== omni_init: loading APM model\n");
+        if (params->apm_model.empty()) {
+            LOG_ERR("%s: error: apm_model path is empty\n", __func__);
+            if (ctx_omni->use_tts) {
+                llama_free(ctx_omni->ctx_tts_llama);
+                llama_free_model(ctx_omni->model_tts);
+                common_sampler_free(ctx_omni->ctx_tts_sampler);
+            }
+            llama_free(ctx_llama);
+            llama_free_model(model);
+            common_sampler_free(sampler);
+            delete ctx_omni;
+            return NULL;
+        }
+        ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+        print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
+        if (ctx_omni->ctx_audio == nullptr) {
+            LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
+            if (ctx_omni->use_tts) {
+                llama_free(ctx_omni->ctx_tts_llama);
+                llama_free_model(ctx_omni->model_tts);
+                common_sampler_free(ctx_omni->ctx_tts_sampler);
+            }
+            llama_free(ctx_llama);
+            llama_free_model(model);
+            common_sampler_free(sampler);
+            delete ctx_omni;
+            return NULL;
+        }
+
+        ctx_omni->n_past = 0;
+
+        if (media_type == 2) {
+            LOG_INF("init vision....");
+            const char * vision_path = ctx_omni->params->vpm_model.c_str();
+            auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
+            ctx_omni->ctx_vision = ctx_vision;
 
         // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
         if (ctx_vision) {
@@ -4256,8 +4351,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 LOG_WRN("Vision CoreML model path does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
             }
         }
-    }
-    
+    } // end if media_type == 2
+    } // end else (shared != nullptr)
+
     ctx_omni->llm_thread_info = new LLMThreadInfo(1000);
     if (ctx_omni->use_tts) {
         LOG_INF("init tts....");
@@ -4268,8 +4364,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Initialize T2W thread info
         LOG_INF("init t2w....");
         ctx_omni->t2w_thread_info = new T2WThreadInfo(25);  // Queue size of 10 chunks
-        
+
         // Initialize C++ Token2Wav session
+        // In shared model mode, the token2wav session comes from omni_shared_init.
+        if (ctx_omni->shared != nullptr && ctx_omni->token2wav_initialized) {
+            // Already initialized from shared — just reset per-session buffer
+            ctx_omni->token2wav_buffer.clear();
+            ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+            ctx_omni->token2wav_wav_idx = 0;
+            print_with_timestamp("Token2Wav: using shared session, buffer reset\n");
+        } else {
         // Try to load token2wav GGUF models from {model_dir}/token2wav-gguf/
         // Fallback to tools/omni/token2wav-gguf if not found
         ctx_omni->token2wav_initialized = false;
@@ -4425,7 +4529,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         } else {
             print_with_timestamp("Token2Wav: model files not found in %s\n", ctx_omni->token2wav_model_dir.c_str());
         }
-        
+        } // end else (shared C++ Token2Wav)
+
         // ==================== 初始化 Python Token2Wav ====================
         // 🔧 默认使用 Python Token2Wav（精度更高）
         // 设置 Python T2W 脚本目录和模型目录
@@ -4753,70 +4858,87 @@ void omni_free(struct omni_context * ctx_omni) {
         }
     }
     
-    vision_free(ctx_omni->ctx_vision);
-    audition_free(ctx_omni->ctx_audio);
-    
+    // Only free vision/audio encoders if we own them (not shared)
+    if (ctx_omni->owns_vision) {
+        vision_free(ctx_omni->ctx_vision);
+    }
+    if (ctx_omni->owns_audio) {
+        audition_free(ctx_omni->ctx_audio);
+    }
+
     if (ctx_omni->use_tts) {
+        // ctx_tts_llama is always per-session and must be freed
         llama_free(ctx_omni->ctx_tts_llama);
-        llama_free_model(ctx_omni->model_tts);
+        // model_tts is only freed if owned (not shared)
+        if (ctx_omni->owns_tts_model) {
+            llama_free_model(ctx_omni->model_tts);
+        }
         common_sampler_free(ctx_omni->ctx_tts_sampler);
 
-        if (ctx_omni->tts_condition_graph.initialized) {
-            tts_condition_graph_free(ctx_omni);
+        if (ctx_omni->owns_tts_weights) {
+            if (ctx_omni->tts_condition_graph.initialized) {
+                tts_condition_graph_free(ctx_omni);
+            }
+
+            // Free TTS weights
+            if (ctx_omni->emb_code_weight) {
+                free(ctx_omni->emb_code_weight);
+                ctx_omni->emb_code_weight = nullptr;
+            }
+            if (ctx_omni->emb_text_weight) {
+                free(ctx_omni->emb_text_weight);
+                ctx_omni->emb_text_weight = nullptr;
+            }
+            if (ctx_omni->projector_semantic_linear1_weight) {
+                free(ctx_omni->projector_semantic_linear1_weight);
+                ctx_omni->projector_semantic_linear1_weight = nullptr;
+            }
+            if (ctx_omni->projector_semantic_linear1_bias) {
+                free(ctx_omni->projector_semantic_linear1_bias);
+                ctx_omni->projector_semantic_linear1_bias = nullptr;
+            }
+            if (ctx_omni->projector_semantic_linear2_weight) {
+                free(ctx_omni->projector_semantic_linear2_weight);
+                ctx_omni->projector_semantic_linear2_weight = nullptr;
+            }
+            if (ctx_omni->projector_semantic_linear2_bias) {
+                free(ctx_omni->projector_semantic_linear2_bias);
+                ctx_omni->projector_semantic_linear2_bias = nullptr;
+            }
+            if (ctx_omni->head_code_weight) {
+                free(ctx_omni->head_code_weight);
+                ctx_omni->head_code_weight = nullptr;
+            }
         }
-        
-        // Free TTS weights
-        if (ctx_omni->emb_code_weight) {
-            free(ctx_omni->emb_code_weight);
-            ctx_omni->emb_code_weight = nullptr;
+
+        if (ctx_omni->owns_token2wav) {
+            // Free C++ Token2Wav session
+            if (ctx_omni->token2wav_session) {
+                ctx_omni->token2wav_session.reset();
+                ctx_omni->token2wav_initialized = false;
+                LOG_INF("Token2Wav (C++): session released\n");
+            }
         }
-        if (ctx_omni->emb_text_weight) {
-            free(ctx_omni->emb_text_weight);
-            ctx_omni->emb_text_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear1_weight) {
-            free(ctx_omni->projector_semantic_linear1_weight);
-            ctx_omni->projector_semantic_linear1_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear1_bias) {
-            free(ctx_omni->projector_semantic_linear1_bias);
-            ctx_omni->projector_semantic_linear1_bias = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear2_weight) {
-            free(ctx_omni->projector_semantic_linear2_weight);
-            ctx_omni->projector_semantic_linear2_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear2_bias) {
-            free(ctx_omni->projector_semantic_linear2_bias);
-            ctx_omni->projector_semantic_linear2_bias = nullptr;
-        }
-        if (ctx_omni->head_code_weight) {
-            free(ctx_omni->head_code_weight);
-            ctx_omni->head_code_weight = nullptr;
-        }
-        
-        // Free C++ Token2Wav session
-        if (ctx_omni->token2wav_session) {
-            ctx_omni->token2wav_session.reset();
-            ctx_omni->token2wav_initialized = false;
-            LOG_INF("Token2Wav (C++): session released\n");
-        }
-        
-        // 🔧 停止 Python Token2Wav 服务
+
+        // 🔧 停止 Python Token2Wav 服务 (always owned if initialized)
         if (ctx_omni->python_t2w_initialized) {
             stop_python_t2w_service(ctx_omni);
         }
-        
-        // Free ggml-based projector model
-        if (ctx_omni->projector.initialized) {
+
+        // Free ggml-based projector model (owned with weights)
+        if (ctx_omni->owns_tts_weights && ctx_omni->projector.initialized) {
             projector_free(ctx_omni->projector);
         }
     }
-    
-    // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
-    // 如果是外部传入的模型（模型复用），则不释放
-    if (ctx_omni->owns_model) {
+
+    // 🔧 [多会话共享] 释放 LLM 上下文
+    // 共享模式下 ctx_llama 是每 session 独立的，需要释放；
+    // 但 model（llama_model*）是共享的，只在使用者 owned 时才释放。
+    // 旧路径（existing_ctx != nullptr）下两者都不释放（由外部管理）。
+    if (ctx_omni->shared != nullptr || ctx_omni->owns_model) {
         llama_free(ctx_omni->ctx_llama);
+    }
+    if (ctx_omni->owns_model) {
         llama_free_model(ctx_omni->model);
     }
     common_sampler_free(ctx_omni->ctx_sampler);
@@ -4842,6 +4964,228 @@ void omni_free(struct omni_context * ctx_omni) {
     // NOTE: do NOT call llama_backend_free() here — the backend/model is shared
     // and owned by the server; freeing it would break the still-running process.
     delete ctx_omni;
+}
+
+// ==================== Shared model lifecycle ====================
+
+struct omni_shared_models * omni_shared_init(struct common_params * params, const std::string & tts_bin_dir,
+                                             int tts_gpu_layers, const std::string & token2wav_device) {
+    auto * shared = new omni_shared_models();
+
+    // 1. Load LLM model (weights only, per-session contexts created via llama_init_from_model)
+    print_with_timestamp("=== omni_shared_init: loading LLM model\n");
+    shared->model = llama_init(params, params->model.path);
+    if (shared->model == NULL) {
+        LOG_ERR("omni_shared_init: failed to load LLM model from %s\n", params->model.path.c_str());
+        delete shared;
+        return nullptr;
+    }
+
+    // 2. Load TTS model (weights only)
+    if (!params->tts_model.empty()) {
+        print_with_timestamp("=== omni_shared_init: loading TTS model with n_gpu_layers=%d\n", tts_gpu_layers);
+        shared->model_tts = llama_init_tts(params, params->tts_model, tts_gpu_layers);
+        if (shared->model_tts == NULL) {
+            LOG_ERR("omni_shared_init: failed to load TTS model from %s\n", params->tts_model.c_str());
+            llama_free_model(shared->model);
+            delete shared;
+            return nullptr;
+        }
+
+        // Load TTS weights via a temporary context, then steal the pointers
+        print_with_timestamp("=== omni_shared_init: loading TTS weights (via temp context)\n");
+        // We create a minimal omni_context to reuse load_tts_weights_from_gguf and
+        // projector_init, then copy the pointers out and discard the context shell.
+        llama_context_params tmp_ctx_params = common_context_params_to_llama(*params);
+        tmp_ctx_params.n_ctx = 128; // minimal; we won't decode with this context
+        llama_context * tmp_tts_ctx = llama_new_context_with_model(shared->model_tts, tmp_ctx_params);
+        if (tmp_tts_ctx == NULL) {
+            LOG_ERR("omni_shared_init: failed to create temp TTS context\n");
+            llama_free_model(shared->model_tts);
+            llama_free_model(shared->model);
+            delete shared;
+            return nullptr;
+        }
+
+        // Temp omni_context for loading weights
+        auto * tmp_octx = new omni_context();
+        tmp_octx->ctx_tts_llama = tmp_tts_ctx;
+        tmp_octx->model_tts = shared->model_tts;
+
+        if (!load_tts_weights_from_gguf(tmp_octx, params->tts_model.c_str())) {
+            LOG_ERR("omni_shared_init: failed to load TTS weights\n");
+            delete tmp_octx;
+            llama_free(tmp_tts_ctx);
+            llama_free_model(shared->model_tts);
+            llama_free_model(shared->model);
+            delete shared;
+            return nullptr;
+        }
+
+        // Steal TTS weight pointers from temp context
+        shared->emb_code_weight = tmp_octx->emb_code_weight;
+        shared->emb_code_vocab_size = tmp_octx->emb_code_vocab_size;
+        shared->emb_code_hidden_size = tmp_octx->emb_code_hidden_size;
+        shared->emb_code_stored_as_transposed = tmp_octx->emb_code_stored_as_transposed;
+        shared->emb_text_weight = tmp_octx->emb_text_weight;
+        shared->emb_text_vocab_size = tmp_octx->emb_text_vocab_size;
+        shared->emb_text_hidden_size = tmp_octx->emb_text_hidden_size;
+        shared->projector_semantic_linear1_weight = tmp_octx->projector_semantic_linear1_weight;
+        shared->projector_semantic_linear1_bias = tmp_octx->projector_semantic_linear1_bias;
+        shared->projector_semantic_linear2_weight = tmp_octx->projector_semantic_linear2_weight;
+        shared->projector_semantic_linear2_bias = tmp_octx->projector_semantic_linear2_bias;
+        shared->projector_semantic_input_dim = tmp_octx->projector_semantic_input_dim;
+        shared->projector_semantic_output_dim = tmp_octx->projector_semantic_output_dim;
+        shared->head_code_weight = tmp_octx->head_code_weight;
+        shared->head_code_hidden_size = tmp_octx->head_code_hidden_size;
+        shared->head_code_num_audio_tokens = tmp_octx->head_code_num_audio_tokens;
+
+        // Load projector into shared
+        std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
+        print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
+        if (!projector_init(shared->projector, projector_path, true)) {
+            print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
+        }
+
+        // Steal TTS condition graph from temp context
+        shared->tts_condition_graph = tmp_octx->tts_condition_graph;
+        tmp_octx->tts_condition_graph.initialized = false; // prevent double-free
+
+        // Free temp context WITHOUT freeing the stolen pointers
+        tmp_octx->emb_code_weight = nullptr;
+        tmp_octx->emb_text_weight = nullptr;
+        tmp_octx->projector_semantic_linear1_weight = nullptr;
+        tmp_octx->projector_semantic_linear1_bias = nullptr;
+        tmp_octx->projector_semantic_linear2_weight = nullptr;
+        tmp_octx->projector_semantic_linear2_bias = nullptr;
+        tmp_octx->head_code_weight = nullptr;
+        tmp_octx->owns_tts_weights = false;    // prevent double-free
+        tmp_octx->owns_token2wav = false;
+        tmp_octx->owns_vision = false;
+        tmp_octx->owns_audio = false;
+        tmp_octx->owns_model = false;
+        tmp_octx->owns_tts_model = false;
+        delete tmp_octx;
+        llama_free(tmp_tts_ctx);
+    }
+
+    // 3. Load vision encoder
+    if (params->vpm_model.empty()) {
+        LOG_ERR("omni_shared_init: vpm_model path is empty\n");
+        llama_free_model(shared->model);
+        if (shared->model_tts) llama_free_model(shared->model_tts);
+        delete shared;
+        return nullptr;
+    }
+    print_with_timestamp("=== omni_shared_init: loading vision model from %s\n", params->vpm_model.c_str());
+    shared->ctx_vision = vision_init(params->vpm_model.c_str(), vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
+    if (shared->ctx_vision == nullptr) {
+        LOG_ERR("omni_shared_init: failed to load vision model\n");
+        llama_free_model(shared->model);
+        if (shared->model_tts) llama_free_model(shared->model_tts);
+        delete shared;
+        return nullptr;
+    }
+    if (!params->vision_coreml_model_path.empty()) {
+        struct stat coreml_stat;
+        if (stat(params->vision_coreml_model_path.c_str(), &coreml_stat) == 0) {
+            shared->coreml_model_path = params->vision_coreml_model_path;
+            vision_set_coreml_model_path(shared->ctx_vision, shared->coreml_model_path.c_str());
+        }
+    }
+    shared->vpm_batch_encode = params->vpm_batch_encode;
+    vision_set_batch_encode(shared->ctx_vision, shared->vpm_batch_encode);
+
+    // 4. Load audio encoder
+    if (params->apm_model.empty()) {
+        LOG_ERR("omni_shared_init: apm_model path is empty\n");
+        vision_free(shared->ctx_vision);
+        llama_free_model(shared->model);
+        if (shared->model_tts) llama_free_model(shared->model_tts);
+        delete shared;
+        return nullptr;
+    }
+    print_with_timestamp("=== omni_shared_init: loading audio model from %s\n", params->apm_model.c_str());
+    shared->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+    if (shared->ctx_audio == nullptr) {
+        LOG_ERR("omni_shared_init: failed to load audio model\n");
+        vision_free(shared->ctx_vision);
+        llama_free_model(shared->model);
+        if (shared->model_tts) llama_free_model(shared->model_tts);
+        delete shared;
+        return nullptr;
+    }
+
+    print_with_timestamp("=== omni_shared_init: all shared models loaded successfully\n");
+    return shared;
+}
+
+void omni_shared_free(struct omni_shared_models * shared) {
+    if (shared == nullptr) return;
+
+    if (shared->ctx_vision) {
+        vision_free(shared->ctx_vision);
+        shared->ctx_vision = nullptr;
+    }
+    if (shared->ctx_audio) {
+        audition_free(shared->ctx_audio);
+        shared->ctx_audio = nullptr;
+    }
+
+    // Free TTS weight buffers
+    free(shared->emb_code_weight); shared->emb_code_weight = nullptr;
+    free(shared->emb_text_weight); shared->emb_text_weight = nullptr;
+    free(shared->projector_semantic_linear1_weight); shared->projector_semantic_linear1_weight = nullptr;
+    free(shared->projector_semantic_linear1_bias); shared->projector_semantic_linear1_bias = nullptr;
+    free(shared->projector_semantic_linear2_weight); shared->projector_semantic_linear2_weight = nullptr;
+    free(shared->projector_semantic_linear2_bias); shared->projector_semantic_linear2_bias = nullptr;
+    free(shared->head_code_weight); shared->head_code_weight = nullptr;
+
+    if (shared->projector.initialized) {
+        projector_free(shared->projector);
+    }
+
+    // Free TTS condition graph
+    // Note: tts_condition_graph uses its own internal state, we can't easily
+    // free it without omni_context. If allocated, it should have been moved
+    // to the first session. We mark it as not initialized here to be safe.
+
+    // Free Token2Wav
+    if (shared->token2wav_session) {
+        shared->token2wav_session.reset();
+    }
+
+    // Free model weights
+    if (shared->model) {
+        llama_free_model(shared->model);
+        shared->model = nullptr;
+    }
+    if (shared->model_tts) {
+        llama_free_model(shared->model_tts);
+        shared->model_tts = nullptr;
+    }
+
+    delete shared;
+}
+
+omni_shared_models::~omni_shared_models() {
+    // Clean up resources without calling delete (the caller owns the object).
+    // This mirrors the resource cleanup in omni_shared_free but skips the final delete.
+    if (ctx_vision) { vision_free(ctx_vision); ctx_vision = nullptr; }
+    if (ctx_audio) { audition_free(ctx_audio); ctx_audio = nullptr; }
+
+    free(emb_code_weight); emb_code_weight = nullptr;
+    free(emb_text_weight); emb_text_weight = nullptr;
+    free(projector_semantic_linear1_weight); projector_semantic_linear1_weight = nullptr;
+    free(projector_semantic_linear1_bias); projector_semantic_linear1_bias = nullptr;
+    free(projector_semantic_linear2_weight); projector_semantic_linear2_weight = nullptr;
+    free(projector_semantic_linear2_bias); projector_semantic_linear2_bias = nullptr;
+    free(head_code_weight); head_code_weight = nullptr;
+
+    if (projector.initialized) { projector_free(projector); }
+    if (token2wav_session) { token2wav_session.reset(); }
+    if (model) { llama_free_model(model); model = nullptr; }
+    if (model_tts) { llama_free_model(model_tts); model_tts = nullptr; }
 }
 
 // ==================== 语言设置函数 ====================
