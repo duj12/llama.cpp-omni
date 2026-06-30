@@ -352,9 +352,12 @@ struct omni_context {
     // session_stop_event: 终止整个会话（预留，目前未使用）
     //                     用于彻底关闭当前会话，需要重新 omni_init
     std::atomic<bool> session_stop_event{false};
+    // 线程控制标志（per-session，多路并发时各自独立）
+    std::atomic<bool> llm_thread_running{true};
+    std::atomic<bool> tts_thread_running{true};
+    std::atomic<bool> t2w_thread_running{true};
     
     // 🔧 [双工模式] 记录当前 decode 是否以 <|listen|> 结束
-    // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
     std::atomic<bool> ended_with_listen{false};
     
     // [滑窗专用] 记录最近一次 decode 结果是 LISTEN 还是 SPEAK

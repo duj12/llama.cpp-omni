@@ -17,6 +17,7 @@
 #include <fstream>
 #include <string>
 
+#define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include "httplib.h"
 #include <nlohmann/json.hpp>
 
@@ -110,6 +111,7 @@ int main(int argc, char ** argv) {
 #else
     httplib::Server svr;
 #endif
+    svr.set_read_timeout(params.timeout_read);
 
     // ========================================================================
     // Load all shared models ONCE at startup

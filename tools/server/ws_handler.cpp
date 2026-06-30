@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include <cpp-httplib/httplib.h>
 
 #include "ws_handler.h"
