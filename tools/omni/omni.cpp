@@ -9721,6 +9721,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- VPM 任务 ----
         auto vpm_task = [&]() -> double {
             if (!has_img) return 0.0;
+            std::lock_guard<std::mutex> lock(ctx_omni->shared->encode_mtx);
             auto t0 = std::chrono::high_resolution_clock::now();
             if (!omni_image_embed_make_chunks_with_filename(
                     ctx_omni->ctx_vision,
@@ -9738,6 +9739,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- APM 任务 ----
         auto apm_task = [&]() -> double {
             if (!has_aud) return 0.0;
+            std::lock_guard<std::mutex> lock(ctx_omni->shared->encode_mtx);
             auto t0 = std::chrono::high_resolution_clock::now();
             auto * audio_embeds = omni_audio_embed_make_with_filename(
                 ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
