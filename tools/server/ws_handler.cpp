@@ -899,12 +899,11 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         frag = std::move(octx->text_queue.front());
                         octx->text_queue.pop_front();
                     }
-
-                    if (octx->text_done_flag && octx->text_queue.empty()) {
-                        break;
-                    }
                 }
 
+                // Handle frag BEFORE checking text_done_flag, otherwise the
+                // last pushed item (__END_OF_TURN__ or __IS_LISTEN__) gets
+                // popped then immediately dropped by the flag check.
                 if (!frag.empty()) {
                     if (frag == "__IS_LISTEN__") {
                         // Express listen via the kind=listen delta channel
@@ -932,6 +931,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                      turn_vision_slices)));
                         }
                     }
+                } else if (octx->text_done_flag && octx->text_queue.empty()) {
+                    // stream_decode finished, nothing left to process
+                    break;
                 }
 
                 if (session_mgr.get(session_id) == nullptr) {
@@ -1080,12 +1082,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         frag = std::move(octx->text_queue.front());
                         octx->text_queue.pop_front();
                     }
-
-                    if (octx->text_done_flag && octx->text_queue.empty()) {
-                        break;
-                    }
                 }
 
+                // IMPORTANT: handle frag BEFORE checking text_done_flag.
+                // stream_decode may push the last item and set flag in one
+                // lock; the old ordering dropped force_listen's __IS_LISTEN__
+                // (and could drop the final text delta too).
                 if (!frag.empty()) {
                     if (frag == "__IS_LISTEN__") {
                         // Model switched to listen
@@ -1111,6 +1113,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                      turn_vision_slices)));
                         }
                     }
+                } else if (octx->text_done_flag && octx->text_queue.empty()) {
+                    // stream_decode finished and nothing left to process
+                    break;
                 }
 
                 // Check if session was closed externally
