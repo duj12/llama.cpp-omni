@@ -86,8 +86,29 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    // Scan & strip custom flags before common_params_parse
+    bool no_tts = false;
+    {
+        int write_idx = 1;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--no-tts") == 0) {
+                no_tts = true;
+            } else {
+                argv[write_idx++] = argv[i];
+            }
+        }
+        argv[write_idx] = nullptr;
+        argc = write_idx;
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    if (no_tts) {
+        LOG_INF("--no-tts: TTS model loading disabled to save VRAM\n");
+        params.tts_model = "";
+        params.tts_bin_dir = "";
     }
 
     // Multi-session: default to 4 concurrent sessions, or use --n-parallel.
@@ -104,6 +125,16 @@ int main(int argc, char ** argv) {
 
     // Auto-detect omni model paths
     ensure_omni_model_paths_from_llm(params);
+
+    // --no-tts: skip loading TTS model entirely to save VRAM
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-tts") == 0) {
+            LOG_INF("--no-tts: clearing TTS model path to save VRAM\n");
+            params.tts_model = "";
+            params.tts_bin_dir = "";
+            break;
+        }
+    }
 
     // HTTP server setup
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT

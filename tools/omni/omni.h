@@ -111,6 +111,9 @@ struct omni_shared_models {
     // Protects shared encoder access (vision/audio encoding calls are not thread-safe)
     std::mutex encode_mtx;
 
+    // Protects Token2Wav session access (feed_window is not thread-safe)
+    std::mutex token2wav_mtx;
+
     ~omni_shared_models();
 };
 
@@ -352,6 +355,8 @@ struct omni_context {
     // session_stop_event: 终止整个会话（预留，目前未使用）
     //                     用于彻底关闭当前会话，需要重新 omni_init
     std::atomic<bool> session_stop_event{false};
+    // Per-session ctx limit for sliding window (set by omni_init, not params->n_ctx)
+    int per_session_n_ctx = 0;
     // 线程控制标志（per-session，多路并发时各自独立）
     std::atomic<bool> llm_thread_running{true};
     std::atomic<bool> tts_thread_running{true};

@@ -966,7 +966,10 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 // omni llm eval
 //
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
-    const int n_ctx = params->n_ctx;
+    // Use per-session context limit if set (avoids checking the shared
+    // params->n_ctx which may be much larger than the per-session ctx).
+    const int n_ctx = ctx_omni->per_session_n_ctx > 0
+        ? ctx_omni->per_session_n_ctx : params->n_ctx;
 
     // ==================== 双工模式：按轮次边界智能清理 ====================
     if (ctx_omni->duplex_mode) {
@@ -4096,12 +4099,17 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->owns_token2wav = false;
 
         llama_context_params ctx_params = common_context_params_to_llama(*params);
-        ctx_params.n_ctx = params->n_ctx;
+        // Per-session: only needs 1 seq and 1/n_parallel of total ctx
+        ctx_params.n_ctx = params->n_ctx / params->n_parallel;
+        ctx_params.n_seq_max = 1;
         ctx_llama = llama_new_context_with_model(model, ctx_params);
         if (ctx_llama == NULL) {
             LOG_ERR("%s: error: failed to create per-session llama_context\n", __func__);
             return NULL;
         }
+        // Store per-session limit for sliding window (don't modify params,
+        // which is shared across concurrent sessions).
+        ctx_omni->per_session_n_ctx = ctx_params.n_ctx;
         print_with_timestamp("=== omni_init: per-session ctx_llama created (n_ctx=%u)\n", ctx_params.n_ctx);
     } else if (existing_model != nullptr && existing_ctx != nullptr) {
         print_with_timestamp("=== omni_init: reusing existing LLM model and context\n");
@@ -4206,12 +4214,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             ctx_omni->head_code_num_audio_tokens = shared->head_code_num_audio_tokens;
             ctx_omni->tts_condition_graph = shared->tts_condition_graph;
 
-            // Share token2wav session
-            ctx_omni->token2wav_session = std::move(shared->token2wav_session);
+            // Share token2wav session (kept in shared — not moved)
+            ctx_omni->owns_token2wav = false;
             ctx_omni->token2wav_initialized = shared->token2wav_initialized;
             ctx_omni->token2wav_model_dir = shared->token2wav_model_dir;
-            // Note: token2wav_session is moved out of shared for first session.
-            // Subsequent sessions create their own or use Python T2W.
+            // Note: token2wav_session stays in shared; all sessions access it
+            // via ctx_omni->shared->token2wav_session with token2wav_mtx protection.
         } else {
             // Non-shared path (original behavior)
             print_with_timestamp("=== omni_init: loading TTS model\n");
@@ -9371,8 +9379,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             tokens_str += "]";
         }
         
-        // Check if token2wav is initialized
-        if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        // Check if token2wav is initialized (shared session)
+        if (!ctx_omni->token2wav_initialized || !ctx_omni->shared || !ctx_omni->shared->token2wav_session) {
             continue;
         }
         
@@ -9398,12 +9406,19 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             bool is_last_window = is_final && (token_buffer.size() <= WINDOW_SIZE);
             
             std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
-            
-            // Time the inference
+
             auto t2w_start = std::chrono::high_resolution_clock::now();
-            
+
             std::vector<float> chunk_wav;
-            if (ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav)) {
+            bool t2w_ok = false;
+            {
+                // Token2Wav session is shared across sessions — protect with mutex
+                std::lock_guard<std::mutex> t2w_lock(ctx_omni->shared->token2wav_mtx);
+                t2w_ok = ctx_omni->shared->token2wav_session->feed_window(
+                    window, is_last_window, chunk_wav);
+            }
+
+            if (t2w_ok) {
                 auto t2w_end = std::chrono::high_resolution_clock::now();
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 
@@ -11566,7 +11581,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 🔧 [滑窗检查] 检查是否需要执行滑窗，确保下一轮有足够空间
         // 当 n_past > n_ctx - reserved_space 时执行滑窗
         const int reserved_space = 1024;  // 预留空间
-        const int n_ctx = ctx_omni->params->n_ctx;
+        const int n_ctx = ctx_omni->per_session_n_ctx > 0
+            ? ctx_omni->per_session_n_ctx : ctx_omni->params->n_ctx;
         
         if (ctx_omni->n_past > n_ctx - reserved_space) {
             print_with_timestamp("⚠️ Decode 结束滑窗检查: n_past=%d > n_ctx-reserved=%d，需要滑窗\n",
