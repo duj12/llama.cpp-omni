@@ -4171,7 +4171,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
 
             llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
-            tts_ctx_params.n_ctx = params->n_ctx;
+            tts_ctx_params.n_ctx = 512;   // TTS processes short text only
+            tts_ctx_params.n_seq_max = 1; // single sequence
             llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
             if (ctx_tts_llama == NULL) {
                 LOG_ERR("%s: error: failed to create per-session TTS llama_context\n", __func__);
@@ -4238,7 +4239,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
             // TTS 模型使用独立的上下文参数
             llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
-            tts_ctx_params.n_ctx = params->n_ctx;
+            tts_ctx_params.n_ctx = 512;
+            tts_ctx_params.n_seq_max = 1;
 
             llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
             if (ctx_tts_llama == NULL) {
@@ -4521,11 +4523,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             if (init_ok) {
                 ctx_omni->token2wav_initialized = true;
-                // Initialize token2wav buffer with 3 silence tokens (4218) as Python does
-                // Python: buffer = [4218] * 3  # 预先放入3个前缀静音token
                 ctx_omni->token2wav_buffer.clear();
                 ctx_omni->token2wav_buffer = {4218, 4218, 4218};
                 ctx_omni->token2wav_wav_idx = 0;
+                // Share pointer so subsequent sessions reuse this session
+                if (ctx_omni->shared != nullptr) {
+                    ctx_omni->shared->token2wav_session.reset(ctx_omni->token2wav_session.release());
+                    ctx_omni->shared->token2wav_initialized = true;
+                    ctx_omni->owns_token2wav = false;
+                }
                 print_with_timestamp("Token2Wav: initialized successfully\n");
             } else {
                 ctx_omni->token2wav_session.reset();
