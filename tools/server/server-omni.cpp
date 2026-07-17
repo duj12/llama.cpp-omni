@@ -105,12 +105,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (no_tts) {
-        LOG_INF("--no-tts: TTS model loading disabled to save VRAM\n");
-        params.tts_model = "";
-        params.tts_bin_dir = "";
-    }
-
     // Multi-session: default to 4 concurrent sessions, or use --n-parallel.
     int max_sessions = params.n_parallel;
     if (max_sessions < 1) {
@@ -126,14 +120,11 @@ int main(int argc, char ** argv) {
     // Auto-detect omni model paths
     ensure_omni_model_paths_from_llm(params);
 
-    // --no-tts: skip loading TTS model entirely to save VRAM
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-tts") == 0) {
-            LOG_INF("--no-tts: clearing TTS model path to save VRAM\n");
-            params.tts_model = "";
-            params.tts_bin_dir = "";
-            break;
-        }
+    // --no-tts must run AFTER ensure_omni_model_paths (which re-sets tts_model)
+    if (no_tts) {
+        LOG_INF("--no-tts: TTS model loading disabled to save VRAM\n");
+        params.tts_model = "";    // cleared after ensure_omni_model_paths
+        params.tts_bin_dir = "";  // cleared after ensure_omni_model_paths
     }
 
     // HTTP server setup

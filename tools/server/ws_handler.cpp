@@ -465,6 +465,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     auto & p = params;
     p.n_predict = 2048;
     ensure_omni_model_paths(p);
+    if (use_tts && shared->model_tts == nullptr) { use_tts = false; }
 
     // Create a NEW per-session omni_context using shared models.
     // Pass shared->model as existing_model (triggers the "shared model, new context" path).
