@@ -4171,7 +4171,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
 
             llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
-            tts_ctx_params.n_ctx = 512;   // TTS processes short text only
+            tts_ctx_params.n_ctx = params->n_ctx / params->n_parallel;  // match per-session LLM ctx
             tts_ctx_params.n_seq_max = 1; // single sequence
             llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
             if (ctx_tts_llama == NULL) {
@@ -4239,7 +4239,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
             // TTS 模型使用独立的上下文参数
             llama_context_params tts_ctx_params = common_context_params_to_llama(*params);
-            tts_ctx_params.n_ctx = 512;
+            tts_ctx_params.n_ctx = params->n_ctx / params->n_parallel;
             tts_ctx_params.n_seq_max = 1;
 
             llama_context * ctx_tts_llama = llama_new_context_with_model(tts_model, tts_ctx_params);
