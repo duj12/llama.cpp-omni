@@ -444,11 +444,14 @@ struct ServerState {
     common_params_sampling sampling;
     bool text_only;
     int  n_batch;
+    int  max_sessions;
+    int  total_n_ctx;
     std::mutex mmproj_mtx;
 
     ServerState(SharedModel & sm, SharedMmproj & mm, SessionManager & m,
-                const common_params_sampling & sp, bool to, int nb)
-        : shared_model(sm), shared_mmproj(mm), mgr(m), sampling(sp), text_only(to), n_batch(nb) {}
+                const common_params_sampling & sp, bool to, int nb, int ms, int tnc)
+        : shared_model(sm), shared_mmproj(mm), mgr(m), sampling(sp),
+          text_only(to), n_batch(nb), max_sessions(ms), total_n_ctx(tnc) {}
 };
 
 // ============================================================================
@@ -481,12 +484,14 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     if (!parsed_init.ok) { ws.close(); return; }
 
     sess.sid = sid;
-    // Default to model's maximum context length (capped to 16384 to save VRAM)
-    // which is safe for multi-frame video (~1530 tokens per frame) + images + audio + text.
-    int max_ctx = llama_model_n_ctx_train(state.shared_model.model);
+    // Per-session n_ctx = total_n_ctx / max_sessions (same as MiniCPM).
+    // User can override via session.init payload.config.n_ctx.
+    int per_session_n_ctx = state.total_n_ctx / state.max_sessions;
+    if (per_session_n_ctx < 128) { per_session_n_ctx = 128; }
     int nc = parsed_init.config.contains("n_ctx") ? parsed_init.config["n_ctx"].get<int>()
-             : std::min(max_ctx > 0 ? max_ctx : 16384, 16384);
-    LOG_INF("session %s: n_ctx=%d (model_train=%d)\n", sid.c_str(), nc, max_ctx);
+             : per_session_n_ctx;
+    LOG_INF("session %s: n_ctx=%d (total=%d max_sessions=%d)\n",
+            sid.c_str(), nc, state.total_n_ctx, state.max_sessions);
 
     auto cp = llama_context_default_params();
     cp.n_ctx    = nc;
@@ -721,6 +726,15 @@ int main(int argc, char ** argv) {
 
     int max_sessions = params.n_parallel > 0 ? params.n_parallel : 4;
     int n_batch      = params.n_batch > 0 ? params.n_batch : 512;
+    // Total KV cache: from -c flag. Per-session = total / max_sessions.
+    int total_n_ctx = params.n_ctx;
+    if (total_n_ctx <= 0) {
+        int max_model_ctx = llama_model_n_ctx_train(shared_model.model);
+        int default_total = std::min(max_model_ctx > 0 ? max_model_ctx : 16384, 16384);
+        total_n_ctx = ((default_total + 2047) / 2048) * 2048;
+    }
+    LOG_INF("Server: max_sessions=%d total_n_ctx=%d (per-session=%d)\n",
+            max_sessions, total_n_ctx, total_n_ctx / max_sessions);
 
     // HTTP server
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -731,7 +745,7 @@ int main(int argc, char ** argv) {
     svr.set_read_timeout(params.timeout_read);
 
     SessionManager mgr(max_sessions);
-    ServerState state(shared_model, shared_mmproj, mgr, params.sampling, text_only, n_batch);
+    ServerState state(shared_model, shared_mmproj, mgr, params.sampling, text_only, n_batch, max_sessions, total_n_ctx);
 
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         json j = {{"status","ok"},{"engine","qwen3omni"},{"sessions",mgr.active_count()}};
