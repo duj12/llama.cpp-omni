@@ -174,3 +174,4 @@ apps/
 # PyTorch checkpoint directories
 pt/
 tools/omni/**/pt/
+tools/
