@@ -347,6 +347,35 @@ static void kv_cache_slide_window(llama_context * ctx, int n_ctx, int * n_past, 
     LOG_INF("sliding window: n_past -> %d (keep=%d)\n", *n_past, n_keep);
 }
 
+// UTF-8 stream sanitizer (from ws_handler.cpp) — buffers incomplete multi-byte
+// sequences across tokens so nlohmann::json::dump() never sees partial characters.
+static std::string sanitize_utf8_stream(std::string & pending,
+                                        const std::string & fragment,
+                                        bool flush = false) {
+    static const std::string replacement = "\xEF\xBF\xBD";
+    std::string input = pending + fragment;
+    pending.clear();
+    std::string out;
+    size_t i = 0;
+    while (i < input.size()) {
+        const unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x80) { out.push_back(static_cast<char>(c)); i++; continue; }
+        int need = 0;
+        if (c >= 0xC2 && c <= 0xDF)       { need = 1; }
+        else if (c >= 0xE0 && c <= 0xEF)  { need = 2; }
+        else if (c >= 0xF0 && c <= 0xF4)  { need = 3; }
+        else { out += replacement; i++; continue; }
+        if (i + need >= input.size()) { pending = input.substr(i); break; }
+        bool ok = true;
+        for (int j = 1; j <= need; ++j) { ok = ok && utf8_is_cont((unsigned char)input[i + j]); }
+        if (!ok) { out += replacement; i++; continue; }
+        out.append(input, i, need + 1);
+        i += need + 1;
+    }
+    if (flush && !pending.empty()) { out += replacement; pending.clear(); }
+    return out;
+}
+
 // ============================================================================
 // True streaming generation — sends text deltas inline as tokens decode.
 // Returns accumulated text (with <|im_end|> stripped) for response.done.
@@ -360,6 +389,7 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
 {
     common_sampler_reset(smpl);
     std::string full_text;
+    std::string utf8_pending;
 
     auto send_delta = [&](const std::string & text) {
         if (!streaming || text.empty()) { return; }
@@ -378,8 +408,10 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
         std::string piece = common_token_to_piece(ctx, id);
         if (piece == "<|im_end|>") { break; }
 
-        full_text += piece;
-        send_delta(piece);
+        // Pass through UTF-8 stream buffer — assembles split multi-byte chars
+        std::string safe = sanitize_utf8_stream(utf8_pending, piece);
+        full_text += safe;
+        send_delta(safe);
 
         llama_token batch_tokens[] = {id};
         auto batch = llama_batch_get_one(batch_tokens, 1);
@@ -390,6 +422,11 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
         batch.pos[0] = n_past++;
         if (llama_decode(ctx, batch)) { break; }
     }
+
+    // Flush remaining incomplete UTF-8
+    std::string tail = sanitize_utf8_stream(utf8_pending, "", true);
+    full_text += tail;
+    send_delta(tail);
 
     auto pos = full_text.find("<|im_end|>");
     if (pos != std::string::npos) { full_text.resize(pos); }
