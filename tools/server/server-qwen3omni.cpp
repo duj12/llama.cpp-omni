@@ -411,7 +411,12 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     if (!parsed_init.ok) { ws.close(); return; }
 
     sess.sid = sid;
-    int nc = parsed_init.config.contains("n_ctx") ? parsed_init.config["n_ctx"].get<int>() : 4096;
+    // Default to model's maximum context length (capped to 16384 to save VRAM)
+    // which is safe for multi-frame video (~1530 tokens per frame) + images + audio + text.
+    int max_ctx = llama_model_n_ctx_train(state.shared_model.model);
+    int nc = parsed_init.config.contains("n_ctx") ? parsed_init.config["n_ctx"].get<int>()
+             : std::min(max_ctx > 0 ? max_ctx : 16384, 16384);
+    LOG_INF("session %s: n_ctx=%d (model_train=%d)\n", sid.c_str(), nc, max_ctx);
 
     auto cp = llama_context_default_params();
     cp.n_ctx    = nc;
