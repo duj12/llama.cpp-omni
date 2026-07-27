@@ -27,6 +27,9 @@
 #include <mutex>
 #include <vector>
 #include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <filesystem>
 
 #define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include "httplib.h"
@@ -34,6 +37,7 @@
 
 // protocol.h defines: using json = nlohmann::ordered_json;
 using json = nlohmann::ordered_json;
+namespace fs = std::filesystem;
 
 // ============================================================================
 // Helper: build WAV from float32 PCM (mono 16 kHz)
@@ -64,6 +68,86 @@ static std::vector<uint8_t> build_wav_from_pcm(const std::vector<float> & pcm) {
     w(36, "data", 4); w4(40, (uint32_t)data_size);
     memcpy(&wav[44], pcm.data(), (size_t)data_size);
     return wav;
+}
+
+// ============================================================================
+// Video extraction helper (ffmpeg)
+// ============================================================================
+
+static std::string shell_quote(const std::string & value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+static bool file_nonempty(const std::string & path) {
+    std::error_code ec;
+    return fs::exists(path, ec) && fs::file_size(path, ec) > 0;
+}
+
+struct ExtractedVideoMedia {
+    std::string video_path;
+    std::string audio_path;
+    std::vector<std::string> frame_paths;
+};
+
+// Decode base64 MP4 to temp file, extract N JPEG frames + audio WAV via ffmpeg.
+static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64,
+                                                     const std::string & temp_dir,
+                                                     int counter,
+                                                     int stack_frames) {
+    ExtractedVideoMedia out;
+    auto raw = b64_decode(video_b64);
+    if (raw.empty()) { return out; }
+
+    const int n_frames = std::max(1, std::min(stack_frames, 8));
+    fs::path dir = fs::path(temp_dir) / ("video_" + std::to_string(counter));
+    fs::create_directories(dir);
+
+    out.video_path = (dir / "input.mp4").string();
+    {
+        std::ofstream f(out.video_path, std::ios::binary);
+        if (!f) { return out; }
+        f.write(reinterpret_cast<const char *>(raw.data()), raw.size());
+        f.close();
+    }
+    if (!file_nonempty(out.video_path)) { return out; }
+
+    // Extract audio: mono 16kHz PCM WAV
+    std::string audio_path = (dir / "audio.wav").string();
+    std::string audio_cmd = "ffmpeg -y -hide_banner -loglevel error -i "
+        + shell_quote(out.video_path)
+        + " -vn -ac 1 -ar 16000 -c:a pcm_f32le "
+        + shell_quote(audio_path);
+    if (std::system(audio_cmd.c_str()) == 0 && file_nonempty(audio_path)) {
+        out.audio_path = audio_path;
+    }
+
+    // Extract N JPEG frames at even intervals
+    std::string frame_pattern = (dir / "frame_%03d.jpg").string();
+    std::string frame_cmd = "ffmpeg -y -hide_banner -loglevel error -i "
+        + shell_quote(out.video_path)
+        + " -an -frames:v " + std::to_string(n_frames)
+        + " -q:v 2 " + shell_quote(frame_pattern);
+    if (std::system(frame_cmd.c_str()) == 0) {
+        for (int i = 1; i <= n_frames; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "frame_%03d.jpg", i);
+            std::string frame_path = (dir / name).string();
+            if (file_nonempty(frame_path)) {
+                out.frame_paths.push_back(frame_path);
+            }
+        }
+    }
+
+    return out;
 }
 
 // ============================================================================
@@ -118,6 +202,11 @@ struct SharedMmproj {
         auto wav = build_wav_from_pcm(pcm);
         if (wav.empty()) { return nullptr; }
         auto * bmp = mtmd_helper_bitmap_init_from_buf(ctx.get(), wav.data(), wav.size());
+        return mtmd::bitmap_ptr(bmp);
+    }
+
+    mtmd::bitmap_ptr bitmap_from_file(const std::string & path) const {
+        auto * bmp = mtmd_helper_bitmap_init_from_file(ctx.get(), path.c_str());
         return mtmd::bitmap_ptr(bmp);
     }
 };
@@ -390,29 +479,74 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
 
         const bool has_images = !last_user->image_b64s.empty();
         const bool has_audio  = !last_user->audio_b64s.empty();
+        const bool has_video  = !last_user->video_b64s.empty();
         const bool use_mmproj = !state.text_only && state.shared_mmproj.ctx != nullptr;
 
         int n_past = 0;
 
-        if (use_mmproj && (has_images || has_audio)) {
+        if (use_mmproj && (has_images || has_audio || has_video)) {
             // ======== MULTIMODAL PATH via mtmd ========
-            int n_media = (int)last_user->image_b64s.size() + (int)last_user->audio_b64s.size();
+
+            // ---- Step 1: extract video frames + audio (if any) ----
+            std::vector<std::string> video_frame_paths;
+            std::string video_audio_path;
+            if (has_video) {
+                const std::string temp_dir = (fs::temp_directory_path() / "qwen3omni_video").string();
+                fs::create_directories(temp_dir);
+                thread_local int video_counter = 0;
+                ++video_counter;
+                for (const auto & vid_b64 : last_user->video_b64s) {
+                    auto vid = extract_video_mp4_media(vid_b64, temp_dir, video_counter,
+                                                       /*stack_frames*/4);
+                    if (!vid.frame_paths.empty()) {
+                        for (auto & fp : vid.frame_paths) {
+                            video_frame_paths.push_back(std::move(fp));
+                        }
+                        // Use first video's audio (most common case: single video per turn)
+                        if (video_audio_path.empty() && !vid.audio_path.empty()) {
+                            video_audio_path = vid.audio_path;
+                        }
+                    }
+                }
+            }
+
+            // ---- Step 2: count total media items ----
+            int n_user_images = (int)last_user->image_b64s.size();
+            int n_video_frames = (int)video_frame_paths.size();
+            int n_total_audio = (int)last_user->audio_b64s.size()
+                              + (video_audio_path.empty() ? 0 : 1);
+            int n_media = n_user_images + n_video_frames + n_total_audio;
+
             std::string prompt = build_qwen3_prompt(msgs, last_user, n_media);
 
+            // ---- Step 3: build bitmaps array ----
             std::vector<mtmd::bitmap_ptr> owned_bmps;
             std::vector<const mtmd_bitmap *> raw_bmps;
             owned_bmps.reserve((size_t)n_media);
             raw_bmps.reserve((size_t)n_media);
 
+            // Images first
             for (const auto & img_b64 : last_user->image_b64s) {
                 auto bmp = state.shared_mmproj.bitmap_from_image_b64(img_b64);
                 if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
             }
+            // Video frames (as images)
+            for (const auto & fpath : video_frame_paths) {
+                auto bmp = state.shared_mmproj.bitmap_from_file(fpath);
+                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+            }
+            // User audio
             for (const auto & aud_b64 : last_user->audio_b64s) {
                 auto bmp = state.shared_mmproj.bitmap_from_audio_b64(aud_b64);
                 if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
             }
+            // Video audio
+            if (!video_audio_path.empty()) {
+                auto bmp = state.shared_mmproj.bitmap_from_file(video_audio_path);
+                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+            }
 
+            // ---- Step 4: mtmd tokenize + eval ----
             mtmd_input_chunks * chunks_raw = mtmd_input_chunks_init();
             mtmd::input_chunks_ptr chunks(chunks_raw);
 
@@ -433,6 +567,12 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             }
             if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
             n_past = (int)new_n_past;
+
+            // Cleanup temp files (best-effort)
+            if (has_video) {
+                for (const auto & fp : video_frame_paths) { fs::remove(fp); }
+                if (!video_audio_path.empty()) { fs::remove(video_audio_path); }
+            }
 
         } else {
             // ======== TEXT PATH (with or without mmproj) ========
