@@ -88,11 +88,14 @@ int main(int argc, char ** argv) {
 
     // Scan & strip custom flags before common_params_parse
     bool no_tts = false;
+    bool text_only = false;
     {
         int write_idx = 1;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--no-tts") == 0) {
                 no_tts = true;
+            } else if (strcmp(argv[i], "--text-only") == 0) {
+                text_only = true;
             } else {
                 argv[write_idx++] = argv[i];
             }
@@ -125,6 +128,15 @@ int main(int argc, char ** argv) {
         LOG_INF("--no-tts: TTS model loading disabled to save VRAM\n");
         params.tts_model = "";    // cleared after ensure_omni_model_paths
         params.tts_bin_dir = "";  // cleared after ensure_omni_model_paths
+    }
+
+    // --text-only: skip all multimodal models, pure text server
+    if (text_only) {
+        LOG_INF("--text-only: all multimodal models disabled\n");
+        params.tts_model = "";
+        params.tts_bin_dir = "";
+        params.vpm_model = "";
+        params.apm_model = "";
     }
 
     // HTTP server setup

@@ -531,7 +531,9 @@ struct clip_image_f32_batch {
 // common utils
 //
 
-static std::string string_format(const char * fmt, ...) {
+// Named with clip_ prefix to avoid ODR conflicts with common.h's
+// string_format / string_starts_with / string_ends_with.
+static std::string clip_str_format(const char * fmt, ...) {
     va_list ap;
     va_list ap2;
     va_start(ap, fmt);
@@ -577,14 +579,13 @@ static std::vector<std::string> string_split_str(std::string s, const std::strin
     return tokens;
 }
 
-// remove when moving to c++20
-inline bool string_starts_with(std::string_view str, std::string_view prefix) {
+// NOTE: string_starts_with / string_ends_with renamed to avoid ODR conflicts with common.h.
+inline bool clip_str_starts_with(std::string_view str, std::string_view prefix) {
     return str.size() >= prefix.size() &&
            str.compare(0, prefix.size(), prefix) == 0;
 }
 
-// remove when moving to c++20
-inline bool string_ends_with(std::string_view str, std::string_view suffix) {
+inline bool clip_str_ends_with(std::string_view str, std::string_view suffix) {
     return str.size() >= suffix.size() &&
            str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
@@ -606,7 +607,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int 
         case GGUF_TYPE_FLOAT32: return std::to_string(((const float    *)data)[i]);
         case GGUF_TYPE_FLOAT64: return std::to_string(((const double   *)data)[i]);
         case GGUF_TYPE_BOOL:    return ((const int8_t *)data)[i] != 0 ? "true" : "false";
-        default:                return string_format("unknown type %d", type);
+        default:                return clip_str_format("unknown type %d", type);
     }
 }
 

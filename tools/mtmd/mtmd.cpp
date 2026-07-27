@@ -210,7 +210,7 @@ struct mtmd_context {
                         pos_type = MTMD_POS_TYPE_MROPE;
                     } break;
                 default:
-                    throw std::runtime_error(string_format("unsupported decoder rope type: %d\n", decoder_rope_type));
+                    throw std::runtime_error(clip_str_format("unsupported decoder rope type: %d\n", decoder_rope_type));
             }
         }
 
@@ -229,7 +229,7 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         if (!ctx_v && !ctx_a) {
-            throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
+            throw std::runtime_error(clip_str_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
         // if both vision and audio mmproj are present, we need to validate their n_embd
@@ -237,7 +237,7 @@ struct mtmd_context {
             int n_embd_v = clip_n_mmproj_embd(ctx_v);
             int n_embd_a = clip_n_mmproj_embd(ctx_a);
             if (n_embd_v != n_embd_a) {
-                throw std::runtime_error(string_format(
+                throw std::runtime_error(clip_str_format(
                     "mismatch between vision and audio mmproj (n_embd_v = %d, n_embd_a = %d)\n",
                     n_embd_v, n_embd_a));
             }
@@ -247,7 +247,7 @@ struct mtmd_context {
         // we can safely assume that they are the same
         int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
-            throw std::runtime_error(string_format(
+            throw std::runtime_error(clip_str_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
                 "hint: you may be using wrong mmproj\n",
                 n_embd_text, n_embd_clip));
@@ -311,7 +311,7 @@ struct mtmd_context {
                         ov_img_first      = true;
 
                     } else if (minicpmv_version != 0) {
-                        throw std::runtime_error(string_format("unsupported minicpmv version: %d\n", minicpmv_version));
+                        throw std::runtime_error(clip_str_format("unsupported minicpmv version: %d\n", minicpmv_version));
                     }
                     image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
                 } break;
@@ -501,7 +501,7 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             default:
-                throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
+                throw std::runtime_error(clip_str_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }
 
         GGML_ASSERT(image_preproc != nullptr);
@@ -565,7 +565,7 @@ struct mtmd_context {
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4a>(ctx_a);
                 } break;
             default:
-                throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
+                throw std::runtime_error(clip_str_format("%s: unexpected audio projector type %d\n", __func__, proj));
         }
 
         // initialize audio preprocessor

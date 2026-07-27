@@ -105,3 +105,31 @@ target_compile_features(${TARGET_VOXCPM2} PRIVATE cxx_std_17)
 target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
 target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+
+# llama-qwen3omni-server (standalone Qwen3-Omni turn-based HTTP/WS API)
+
+if (LLAMA_OPENSSL)
+    find_package(OpenSSL)
+endif()
+
+set(TARGET_QWEN3OMNI llama-qwen3omni-server)
+
+add_executable(${TARGET_QWEN3OMNI}
+    server-qwen3omni.cpp
+    session.h
+    session.cpp
+    protocol.h
+    protocol.cpp
+)
+install(TARGETS ${TARGET_QWEN3OMNI} RUNTIME)
+
+target_link_libraries(${TARGET_QWEN3OMNI} PRIVATE llama-common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (LLAMA_OPENSSL AND OpenSSL_FOUND)
+    target_link_libraries(${TARGET_QWEN3OMNI} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(${TARGET_QWEN3OMNI} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+endif()
+target_compile_features(${TARGET_QWEN3OMNI} PRIVATE cxx_std_17)
+target_include_directories(${TARGET_QWEN3OMNI} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET_QWEN3OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+target_include_directories(${TARGET_QWEN3OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_include_directories(${TARGET_QWEN3OMNI} PRIVATE ../mtmd)

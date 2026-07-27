@@ -28,6 +28,10 @@ struct OmniSession {
     bool owns_octx = false;
     double created_at = 0.0;
     std::function<void()> close_ws;
+    // Cleanup callback invoked by SessionManager::close().
+    // Allows decoupling model-specific cleanup (e.g. omni_free, llama_free)
+    // from the generic session manager, so it can be reused across servers.
+    std::function<void()> cleanup_fn;
 };
 
 // SessionManager — manages multiple concurrent backend sessions.

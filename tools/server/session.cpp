@@ -1,5 +1,4 @@
 #include "session.h"
-#include "omni.h"
 
 #include <random>
 #include <sstream>
@@ -129,12 +128,11 @@ void SessionManager::close(const std::string & session_id) {
         sessions_.erase(it);
     }
 
-    // Release omni_context outside the manager lock. omni_free stops and joins
-    // inference threads and can touch shared backend state, so holding mtx_ here
-    // can race with WS cleanup or block unrelated lifecycle checks.
-    if (to_free && to_free->owns_octx && to_free->octx) {
-        omni_free(to_free->octx);
-        to_free->octx = nullptr;
+    // Run the session's cleanup callback outside the manager lock. The callback
+    // may free model contexts, join threads, or release encoder resources, so
+    // holding mtx_ here could race with WS cleanup on other threads.
+    if (to_free && to_free->cleanup_fn) {
+        to_free->cleanup_fn();
     }
 }
 
@@ -169,9 +167,8 @@ void SessionManager::shutdown() {
     }
 
     for (auto & to_free : to_free_list) {
-        if (to_free && to_free->owns_octx && to_free->octx) {
-            omni_free(to_free->octx);
-            to_free->octx = nullptr;
+        if (to_free && to_free->cleanup_fn) {
+            to_free->cleanup_fn();
         }
     }
 }

@@ -829,6 +829,15 @@ llm_arch llm_arch_from_string(const std::string & name) {
         }
     }
 
+    // Architecture aliases
+    static const std::map<std::string, llm_arch> LLM_ARCH_ALIASES = {
+        { "qwen3omnimoe", LLM_ARCH_QWEN3VLMOE }, // Qwen3-Omni MoE (structurally identical to qwen3vlmoe)
+    };
+    auto alias_it = LLM_ARCH_ALIASES.find(name);
+    if (alias_it != LLM_ARCH_ALIASES.end()) {
+        return alias_it->second;
+    }
+
     return LLM_ARCH_UNKNOWN;
 }
 

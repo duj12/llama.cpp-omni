@@ -579,6 +579,19 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         return;
     }
 
+    // Register cleanup callback so SessionManager::close() can free the
+    // omni_context without depending on the omni library directly.
+    {
+        auto * s = session_mgr.get(session_id);
+        if (s) {
+            s->cleanup_fn = [octx]() {
+                if (octx) {
+                    omni_free(octx);
+                }
+            };
+        }
+    }
+
     // Full-duplex requires index=0 prefill before the first frame.
     // Lock the shared encoder mutex for vision/audio encoding.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
