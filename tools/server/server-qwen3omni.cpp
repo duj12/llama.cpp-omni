@@ -159,6 +159,8 @@ struct Qwen3Session {
     common_sampler * smpl = nullptr;
     std::string sid;
     int resp_cnt = 0;
+    int n_ctx = 0;    // KV cache capacity (session n_ctx)
+    int n_keep = 0;   // system prompt length (protected from sliding window)
 
     ~Qwen3Session() {
         if (smpl) { common_sampler_free(smpl); smpl = nullptr; }
@@ -307,21 +309,77 @@ static bool eval_tokens(llama_context * ctx, const std::vector<llama_token> & to
     return true;
 }
 
-static std::string generate_tokens(llama_context * ctx, common_sampler * smpl,
-                                    int n_past, int max_new, llama_token eos)
+// ============================================================================
+// UTF-8 safe streaming helpers (defined before usage in streaming generator)
+// ============================================================================
+
+static bool utf8_is_cont(unsigned char b) {
+    return (b & 0xC0) == 0x80;
+}
+
+static std::vector<std::string> utf8_safe_chunks(const std::string & text, size_t target) {
+    std::vector<std::string> chunks;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = std::min(pos + target, text.size());
+        while (end < text.size() && utf8_is_cont((unsigned char)text[end])) { end++; }
+        chunks.push_back(text.substr(pos, end - pos));
+        pos = end;
+    }
+    return chunks;
+}
+
+// ============================================================================
+// KV cache sliding window (keep system prompt, evict oldest tokens)
+// ============================================================================
+
+static void kv_cache_slide_window(llama_context * ctx, int n_ctx, int * n_past, int n_keep) {
+    const int slack = 512;
+    if (*n_past + 1 < n_ctx - slack) { return; }
+    if (n_keep <= 0) { return; }
+
+    int n_discard = std::max(16, *n_past - n_keep - (n_ctx / 4));
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (mem) {
+        llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard);
+    }
+    *n_past -= n_discard;
+    LOG_INF("sliding window: n_past -> %d (keep=%d)\n", *n_past, n_keep);
+}
+
+// ============================================================================
+// True streaming generation — sends text deltas inline as tokens decode.
+// Returns accumulated text (with <|im_end|> stripped) for response.done.
+// ============================================================================
+
+static std::string generate_tokens_streaming(llama_context * ctx, common_sampler * smpl,
+                                              int n_past, int n_ctx, int n_keep,
+                                              int max_new, llama_token eos,
+                                              const std::string & sid, const std::string & rid,
+                                              httplib::ws::WebSocket & ws, bool streaming)
 {
     common_sampler_reset(smpl);
-    std::string out;
+    std::string full_text;
+
+    auto send_delta = [&](const std::string & text) {
+        if (!streaming || text.empty()) { return; }
+        for (const auto & ch : utf8_safe_chunks(text, 4)) {
+            ws.send(make_text_delta(sid, rid, ch, ProtocolMetrics{}).dump());
+        }
+    };
+
     for (int i = 0; i < max_new; ++i) {
+        kv_cache_slide_window(ctx, n_ctx, &n_past, n_keep);
+
         llama_token id = common_sampler_sample(smpl, ctx, -1);
         common_sampler_accept(smpl, id, true);
-        // Qwen3 uses <|im_end|> (151645) as EOS. Accept both the lookup-based
-        // eos and the hardcoded Qwen3 token ID, plus detect the rendered text.
         if (id == eos || id == 151645) { break; }
 
         std::string piece = common_token_to_piece(ctx, id);
         if (piece == "<|im_end|>") { break; }
-        out += piece;
+
+        full_text += piece;
+        send_delta(piece);
 
         llama_token batch_tokens[] = {id};
         auto batch = llama_batch_get_one(batch_tokens, 1);
@@ -332,35 +390,10 @@ static std::string generate_tokens(llama_context * ctx, common_sampler * smpl,
         batch.pos[0] = n_past++;
         if (llama_decode(ctx, batch)) { break; }
     }
-    return out;
-}
 
-// ============================================================================
-// UTF-8 safe streaming helpers
-// ============================================================================
-
-// Return true if byte b is a UTF-8 continuation byte (10xxxxxx)
-static bool utf8_is_cont(unsigned char b) {
-    return (b & 0xC0) == 0x80;
-}
-
-// Split text into chunks of at most `target` bytes, only at UTF-8 character
-// boundaries.  nlohmann::json::dump() throws type_error.316 on incomplete
-// UTF-8, so we must never produce a chunk that ends in the middle of a
-// multi-byte character (common with CJK text which is 3 bytes per char).
-static std::vector<std::string> utf8_safe_chunks(const std::string & text, size_t target) {
-    std::vector<std::string> chunks;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        size_t end = std::min(pos + target, text.size());
-        // If end lands on a continuation byte, extend to the next char boundary
-        while (end < text.size() && utf8_is_cont((unsigned char)text[end])) {
-            end++;
-        }
-        chunks.push_back(text.substr(pos, end - pos));
-        pos = end;
-    }
-    return chunks;
+    auto pos = full_text.find("<|im_end|>");
+    if (pos != std::string::npos) { full_text.resize(pos); }
+    return full_text;
 }
 
 // ============================================================================
@@ -425,6 +458,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     cp.n_seq_max = 1;
     sess.ctx = llama_init_from_model(state.shared_model.model, cp);
     if (!sess.ctx) { fail_fast("ctx_init_failed"); return; }
+    sess.n_ctx = nc;
 
     sess.smpl = common_sampler_init(state.shared_model.model, state.sampling);
     if (!sess.smpl) { fail_fast("sampler_init_failed"); return; }
@@ -453,7 +487,6 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
         auto parsed_input = parse_input_append(msg);
         if (!parsed_input.ok) { fail_fast("invalid_input"); return; }
 
-        const auto t_start = std::chrono::high_resolution_clock::now();
         std::string rid = sid + "-" + std::to_string(++sess.resp_cnt);
         int max_new = parsed_input.max_new_tokens > 0 ? parsed_input.max_new_tokens : 512;
 
@@ -572,6 +605,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             }
             if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
             n_past = (int)new_n_past;
+            if (sess.n_keep == 0) { sess.n_keep = n_past; }
 
             // Cleanup temp files (best-effort)
             if (has_video) {
@@ -587,44 +621,16 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             if (!eval_tokens(sess.ctx, toks, state.n_batch, &n_past)) {
                 fail_fast("eval_failed"); return;
             }
+            if (sess.n_keep == 0) { sess.n_keep = n_past; }
         }
 
-        // ---- Generate tokens ----
-        auto gen_start = std::chrono::high_resolution_clock::now();
-        auto text = generate_tokens(sess.ctx, sess.smpl, n_past, max_new, eos_tok);
-        auto gen_end = std::chrono::high_resolution_clock::now();
-        double gen_ms  = std::chrono::duration<double,std::milli>(gen_end - gen_start).count();
-        double wall_ms = std::chrono::duration<double,std::milli>(gen_end - t_start).count();
+        // ---- Generate tokens (true streaming — deltas sent inline) ----
+        auto text = generate_tokens_streaming(sess.ctx, sess.smpl, n_past, sess.n_ctx, sess.n_keep,
+                                               max_new, eos_tok,
+                                               sid, rid, ws, parsed_input.streaming);
 
-        // ---- Send response ----
-        // Safety: strip everything after the first <|im_end|> (in case the
-        // model generates past the EOS token despite our checks above)
-        std::string clean_text = text;
-        {
-            auto pos = clean_text.find("<|im_end|>");
-            if (pos != std::string::npos) {
-                clean_text.resize(pos);
-            }
-        }
-
-        {
-            json m;
-            m["backend"]       = "qwen3omni";
-            m["generate_ms"]   = gen_ms;
-            m["wall_clock_ms"] = wall_ms;
-
-            if (parsed_input.streaming && !clean_text.empty()) {
-                // Use UTF-8-safe chunking to avoid nlohmann type_error.316 on CJK
-                auto chunks = utf8_safe_chunks(clean_text, 4);
-                for (const auto & chunk : chunks) {
-                    ws.send(make_text_delta(sid, rid, chunk, ProtocolMetrics{}).dump());
-                }
-            } else if (!clean_text.empty()) {
-                ws.send(make_text_delta(sid, rid, clean_text, ProtocolMetrics{}).dump());
-            }
-
-            ws.send(make_response_done(sid, rid, clean_text, "", "turn_end", ProtocolMetrics{}).dump());
-        }
+        // Send response.done
+        ws.send(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{}).dump());
     }
 
     // ---- Cleanup on disconnect ----
