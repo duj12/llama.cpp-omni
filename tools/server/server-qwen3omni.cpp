@@ -180,6 +180,10 @@ struct SharedMmproj {
         p.use_gpu    = use_gpu;
         p.n_threads  = n_threads;
         p.warmup     = true;
+        // Limit max image tokens to ~512 so 1440x1080 video frames produce
+        // ~494 tokens each (vs 1530 with the default 4096 limit), allowing
+        // more frames to fit in limited KV cache.
+        p.image_max_tokens = 512;
         auto * raw = mtmd_init_from_file(path.c_str(), text_model, p);
         if (!raw) { return false; }
         ctx.reset(raw);
