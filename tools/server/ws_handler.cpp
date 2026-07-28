@@ -297,7 +297,7 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
     auto raw = b64_decode(video_b64);
     if (raw.empty()) { return out; }
 
-    const int max_frames = std::max(1, std::min(stack_frames, 8));
+    // Cap at 8 frames - frontend does not send stack_frames.
     fs::path dir = fs::path(temp_dir) / ("video_" + std::to_string(counter));
     fs::create_directories(dir);
 
@@ -333,8 +333,8 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
         out.audio_path = audio_path;
     }
 
-    // Extract frames at 1fps across the video, capped to max_frames.
-    int n_frames = std::min((int)std::ceil(duration), max_frames);
+    // Extract frames at 1fps across the video, capped to 8.
+    int n_frames = std::min((int)std::ceil(duration), 8);
     std::string frame_pattern = (dir / "frame_%03d.jpg").string();
     std::string frame_cmd =
         "ffmpeg -y -hide_banner -loglevel error -i " + shell_quote(out.video_path) +
