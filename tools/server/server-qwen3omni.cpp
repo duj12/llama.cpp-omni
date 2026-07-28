@@ -39,6 +39,11 @@
 using json = nlohmann::ordered_json;
 namespace fs = std::filesystem;
 
+// Replace invalid UTF-8 instead of throwing (nlohmann default is strict).
+static std::string json_safe_dump(const json & j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 // ============================================================================
 // Helper: build WAV from float32 PCM (mono 16 kHz)
 // ============================================================================
@@ -416,7 +421,7 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
     auto send_delta = [&](const std::string & text) {
         if (!streaming || text.empty()) { return; }
         for (const auto & ch : utf8_safe_chunks(text, 4)) {
-            ws.send(make_text_delta(sid, rid, ch, ProtocolMetrics{}).dump());
+            ws.send(json_safe_dump(make_text_delta(sid, rid, ch, ProtocolMetrics{})));
         }
     };
 
@@ -494,7 +499,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
 
     auto fail_fast = [&](const std::string & reason) {
         if (!sid.empty()) {
-            ws.send(make_session_closed(sid, reason).dump());
+            ws.send(json_safe_dump(make_session_closed(sid, reason)));
         }
         state.mgr.close(sid);
         ws.close();
@@ -533,7 +538,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     if (!sess.smpl) { fail_fast("sampler_init_failed"); return; }
 
     state.mgr.activate(sid, nullptr, false);
-    ws.send(make_session_created(sid, parsed_init.mode).dump());
+    ws.send(json_safe_dump(make_session_created(sid, parsed_init.mode)));
     LOG_INF("session %s started (text_only=%d)\n", sid.c_str(), (int)state.text_only);
 
     // ---- Read loop: input.append ----
@@ -699,12 +704,12 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                                                sid, rid, ws, parsed_input.streaming);
 
         // Send response.done
-        ws.send(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{}).dump());
+        ws.send(json_safe_dump(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{})));
     }
 
     // ---- Cleanup on disconnect ----
     LOG_INF("session %s disconnected\n", sid.c_str());
-    ws.send(make_session_closed(sid, "client_disconnected").dump());
+    ws.send(json_safe_dump(make_session_closed(sid, "client_disconnected")));
     state.mgr.close(sid);
 }
 
