@@ -428,8 +428,13 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
     full_text += tail;
     send_delta(tail);
 
+    // Strip <|im_end|> and ensure valid UTF-8 for json::dump()
     auto pos = full_text.find("<|im_end|>");
     if (pos != std::string::npos) { full_text.resize(pos); }
+    {
+        std::string dummy;
+        full_text = sanitize_utf8_stream(dummy, full_text, true);
+    }
     return full_text;
 }
 
