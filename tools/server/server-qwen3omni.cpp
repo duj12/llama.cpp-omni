@@ -185,12 +185,11 @@ struct Qwen3Session {
     common_sampler * smpl = nullptr;
     std::string sid;
     int resp_cnt = 0;
-    int n_ctx = 0;    // KV cache capacity (session n_ctx)
-    int n_keep = 0;   // system prompt length (protected from sliding window)
-
+    int n_ctx = 0;
+    int n_keep = 0;
     ~Qwen3Session() {
         if (smpl) { common_sampler_free(smpl); smpl = nullptr; }
-        if (ctx)  { llama_free(ctx);            ctx  = nullptr; }
+        if (ctx) { llama_free(ctx); ctx = nullptr; }
     }
 };
 
@@ -478,11 +477,56 @@ struct ServerState {
     int  max_sessions;
     int  total_n_ctx;
     std::mutex mmproj_mtx;
+    // Pre-allocated context pool to avoid CUDA fragmentation on second alloc.
+    std::vector<llama_context *> ctx_pool;
+    std::mutex ctx_pool_mtx;
 
     ServerState(SharedModel & sm, SharedMmproj & mm, SessionManager & m,
                 const common_params_sampling & sp, bool to, int nb, int ms, int tnc)
         : shared_model(sm), shared_mmproj(mm), mgr(m), sampling(sp),
-          text_only(to), n_batch(nb), max_sessions(ms), total_n_ctx(tnc) {}
+          text_only(to), n_batch(nb), max_sessions(ms), total_n_ctx(tnc) {
+        int per_session_n_ctx = total_n_ctx / max_sessions;
+        if (per_session_n_ctx < 128) { per_session_n_ctx = 128; }
+        auto cp = llama_context_default_params();
+        cp.n_ctx    = per_session_n_ctx;
+        cp.n_batch  = n_batch;
+        cp.n_ubatch = n_batch;
+        cp.n_seq_max = 1;
+        ctx_pool.resize(max_sessions, nullptr);
+        for (int i = 0; i < max_sessions; i++) {
+            ctx_pool[i] = llama_init_from_model(sm.model, cp);
+            if (!ctx_pool[i]) {
+                LOG_ERR("Failed to pre-allocate context %d/%d\n", i + 1, max_sessions);
+            } else {
+                LOG_INF("Pre-allocated context %d/%d\n", i + 1, max_sessions);
+            }
+        }
+    }
+
+    llama_context * borrow_ctx() {
+        std::lock_guard<std::mutex> lock(ctx_pool_mtx);
+        for (auto & ctx : ctx_pool) {
+            if (ctx) { auto * r = ctx; ctx = nullptr; return r; }
+        }
+        return nullptr;
+    }
+
+    void return_ctx(llama_context * ctx) {
+        if (!ctx) return;
+        {
+            llama_memory_t mem = llama_get_memory(ctx);
+            if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
+        }
+        std::lock_guard<std::mutex> lock(ctx_pool_mtx);
+        for (auto & slot : ctx_pool) {
+            if (slot == nullptr) { slot = ctx; return; }
+        }
+        llama_free(ctx);
+    }
+
+    ~ServerState() {
+        for (auto ctx : ctx_pool) { if (ctx) llama_free(ctx); }
+    }
 };
 
 // ============================================================================
@@ -657,7 +701,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
             }
 
-            // ---- Step 4: mtmd tokenize + eval ----
+            // ---- Step 4: mtmd tokenize + eval (locked) ----
             mtmd_input_chunks * chunks_raw = mtmd_input_chunks_init();
             mtmd::input_chunks_ptr chunks(chunks_raw);
 
@@ -666,17 +710,17 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             txt.add_special   = true;
             txt.parse_special = false;
 
-            int32_t ret = mtmd_tokenize(state.shared_mmproj.ctx.get(), chunks_raw,
-                                        &txt, raw_bmps.data(), raw_bmps.size());
-            if (ret != 0) { fail_fast("mtmd_tokenize_failed"); return; }
-
             llama_pos new_n_past = 0;
             {
                 std::lock_guard<std::mutex> lock(state.mmproj_mtx);
+                int32_t ret = mtmd_tokenize(state.shared_mmproj.ctx.get(), chunks_raw,
+                                            &txt, raw_bmps.data(), raw_bmps.size());
+                if (ret != 0) { fail_fast("mtmd_tokenize_failed"); return; }
+
                 ret = mtmd_helper_eval_chunks(state.shared_mmproj.ctx.get(), sess.ctx,
                                               chunks_raw, 0, 0, state.n_batch, true, &new_n_past);
+                if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
             }
-            if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
             n_past = (int)new_n_past;
             if (sess.n_keep == 0) { sess.n_keep = std::min(n_past, 512); }
 
@@ -760,9 +804,7 @@ int main(int argc, char ** argv) {
     // Total KV cache: from -c flag. Per-session = total / max_sessions.
     int total_n_ctx = params.n_ctx;
     if (total_n_ctx <= 0) {
-        int max_model_ctx = llama_model_n_ctx_train(shared_model.model);
-        int default_total = std::min(max_model_ctx > 0 ? max_model_ctx : 16384, 16384);
-        total_n_ctx = ((default_total + 2047) / 2048) * 2048;
+        total_n_ctx = 16384;
     }
     LOG_INF("Server: max_sessions=%d total_n_ctx=%d (per-session=%d)\n",
             max_sessions, total_n_ctx, total_n_ctx / max_sessions);
