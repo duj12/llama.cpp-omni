@@ -107,7 +107,8 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
     auto raw = b64_decode(video_b64);
     if (raw.empty()) { return out; }
 
-    // Cap at 4 frames (KV cache constraint for Qwen3VL 972 tokens/frame).
+    // Cap at 8 frames, adaptive fps. Example: 8s video -> 8 frames (1fps),
+    // 16s video -> 8 frames (0.5fps), 4s video -> 4 frames (1fps).
     fs::path dir = fs::path(temp_dir) / ("video_" + std::to_string(counter));
     fs::create_directories(dir);
 
@@ -145,13 +146,17 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
         out.audio_path = audio_path;
     }
 
-    // Extract frames at 1fps across the video duration, capped to 4.
-    int n_frames = std::min((int)std::ceil(duration), 4);
+    // Extract N frames evenly across the video duration (capped to 8).
+    int n_frames = std::min((int)std::ceil(duration), 8);
+    double fps_val = (double)n_frames / std::max(duration, 1.0);
     std::string frame_pattern = (dir / "frame_%03d.jpg").string();
+    // Convert fps to a fraction string for ffmpeg
+    char fps_str[32];
+    snprintf(fps_str, sizeof(fps_str), "%.4f", fps_val);
     std::string frame_cmd = "ffmpeg -y -hide_banner -loglevel error -i "
         + shell_quote(out.video_path)
         + " -t " + std::to_string(duration)
-        + " -an -vf fps=1 -q:v 2 "
+        + " -an -vf fps=" + std::string(fps_str) + " -q:v 2 "
         + shell_quote(frame_pattern);
     if (std::system(frame_cmd.c_str()) == 0) {
         for (int i = 1; i <= n_frames; ++i) {
