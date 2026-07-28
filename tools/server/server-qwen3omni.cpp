@@ -180,10 +180,6 @@ struct SharedMmproj {
         p.use_gpu    = use_gpu;
         p.n_threads  = n_threads;
         p.warmup     = true;
-        // Limit max image tokens to ~512 so 1440x1080 video frames produce
-        // ~494 tokens each (vs 1530 with the default 4096 limit), allowing
-        // more frames to fit in limited KV cache.
-        p.image_max_tokens = 512;
         auto * raw = mtmd_init_from_file(path.c_str(), text_model, p);
         if (!raw) { return false; }
         ctx.reset(raw);
@@ -586,7 +582,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 ++video_counter;
                 for (const auto & vid_b64 : last_user->video_b64s) {
                     auto vid = extract_video_mp4_media(vid_b64, temp_dir, video_counter,
-                                                       /*stack_frames*/4);
+                                                       /*stack_frames*/2);
                     if (!vid.frame_paths.empty()) {
                         for (auto & fp : vid.frame_paths) {
                             video_frame_paths.push_back(std::move(fp));

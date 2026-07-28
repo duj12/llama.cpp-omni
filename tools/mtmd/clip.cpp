@@ -1404,7 +1404,11 @@ struct clip_model_loader {
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
-                        hparams.set_limit_image_tokens(8, 4096);
+                        // Changed from 4096 to 1024 to match native 768x768 training
+                        // resolution (max_pixels=1,048,576). This prevents OOM on
+                        // high-res images (1440x1080 -> ~972 tokens vs 1530 default)
+                        // while keeping enough detail for accurate understanding.
+                        hparams.set_limit_image_tokens(8, 1024);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {

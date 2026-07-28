@@ -168,12 +168,6 @@ class Qwen3OmniMmprojModel(Qwen3VLVisionModel, Qwen25AudioModel):
             # With patch_size=16, spatial_merge_size=2: each 32x32 pixel block
             # produces 1 token per 2 frames (temporal_patch_size=2).
             # image_size=768 -> (768/16)^2/4 = 576 tokens/2frames.
-            if self.hparams_vision:
-                image_size = self.hparams_vision.get("image_size", 768)
-                min_pixels = image_size * image_size // 2
-                max_pixels = image_size * image_size
-                self.gguf_writer.add_vision_min_pixels(min_pixels)
-                self.gguf_writer.add_vision_max_pixels(max_pixels)
         if self.has_audio_encoder:
             Qwen25AudioModel.set_gguf_parameters(self)
             self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.QWEN3A)
