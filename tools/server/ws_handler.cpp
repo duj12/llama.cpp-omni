@@ -295,24 +295,34 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
                                                    int stack_frames) {
     ExtractedVideoMedia out;
     auto raw = b64_decode(video_b64);
-    if (raw.empty()) {
-        return out;
-    }
+    if (raw.empty()) { return out; }
 
-    const int n_frames = std::max(1, std::min(stack_frames, 8));
+    const int max_frames = std::max(1, std::min(stack_frames, 8));
     fs::path dir = fs::path(temp_dir) / ("video_" + std::to_string(counter));
     fs::create_directories(dir);
 
     out.video_path = (dir / "input.mp4").string();
     {
         std::ofstream f(out.video_path, std::ios::binary);
-        if (!f) {
-            return out;
-        }
+        if (!f) { return out; }
         f.write(reinterpret_cast<const char *>(raw.data()), raw.size());
     }
-    if (!file_nonempty(out.video_path)) {
-        return out;
+    if (!file_nonempty(out.video_path)) { return out; }
+
+    // Get video duration via ffprobe
+    double duration = 30.0;
+    {
+        std::string probe_cmd =
+            "ffprobe -v error -show_entries format=duration -of csv=p=0 "
+            + shell_quote(out.video_path);
+        FILE * fp = popen(probe_cmd.c_str(), "r");
+        if (fp) {
+            char buf[64];
+            if (fgets(buf, sizeof(buf), fp) != NULL) {
+                duration = std::atof(buf);
+            }
+            pclose(fp);
+        }
     }
 
     std::string audio_path = (dir / "audio.wav").string();
@@ -323,11 +333,13 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
         out.audio_path = audio_path;
     }
 
+    // Extract frames at 1fps across the video, capped to max_frames.
+    int n_frames = std::min((int)std::ceil(duration), max_frames);
     std::string frame_pattern = (dir / "frame_%03d.jpg").string();
     std::string frame_cmd =
         "ffmpeg -y -hide_banner -loglevel error -i " + shell_quote(out.video_path) +
-        " -an -frames:v " + std::to_string(n_frames) +
-        " -q:v 2 " + shell_quote(frame_pattern);
+        " -t " + std::to_string(duration) +
+        " -an -vf fps=1 -q:v 2 " + shell_quote(frame_pattern);
     if (std::system(frame_cmd.c_str()) == 0) {
         for (int i = 1; i <= n_frames; ++i) {
             char name[32];
@@ -341,7 +353,6 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
 
     return out;
 }
-
 static std::string truncate_for_prompt(const std::string & text, size_t max_chars) {
     if (text.size() <= max_chars) {
         return text;
