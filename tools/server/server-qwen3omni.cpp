@@ -112,8 +112,7 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
     auto raw = b64_decode(video_b64);
     if (raw.empty()) { return out; }
 
-    // Cap at 8 frames, adaptive fps. Example: 8s video -> 8 frames (1fps),
-    // 16s video -> 8 frames (0.5fps), 4s video -> 4 frames (1fps).
+    // Cap at 4 frames (972 tokens each, leaves ~4K for generation).
     fs::path dir = fs::path(temp_dir) / ("video_" + std::to_string(counter));
     fs::create_directories(dir);
 
@@ -152,7 +151,7 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
     }
 
     // Extract N frames evenly across the video duration (capped to 8).
-    int n_frames = std::min((int)std::ceil(duration), 8);
+    int n_frames = std::min((int)std::ceil(duration), 4);
     double fps_val = (double)n_frames / std::max(duration, 1.0);
     std::string frame_pattern = (dir / "frame_%03d.jpg").string();
     // Convert fps to a fraction string for ffmpeg
@@ -679,7 +678,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             }
             if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
             n_past = (int)new_n_past;
-            if (sess.n_keep == 0) { sess.n_keep = n_past; }
+            if (sess.n_keep == 0) { sess.n_keep = std::min(n_past, 512); }
 
             // Cleanup temp files (best-effort)
             if (has_video) {
@@ -695,7 +694,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             if (!eval_tokens(sess.ctx, toks, state.n_batch, &n_past)) {
                 fail_fast("eval_failed"); return;
             }
-            if (sess.n_keep == 0) { sess.n_keep = n_past; }
+            if (sess.n_keep == 0) { sess.n_keep = std::min(n_past, 512); }
         }
 
         // ---- Generate tokens (true streaming — deltas sent inline) ----
