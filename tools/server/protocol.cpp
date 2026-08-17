@@ -272,8 +272,8 @@ ParsedSessionInit parse_session_init(const json & msg) {
 
     // mode
     std::string mode = json_str(p, "mode", "full_duplex");
-    if (mode != "full_duplex" && mode != "turn_based") {
-        out.error = "invalid mode: " + mode + " (expected full_duplex or turn_based)";
+    if (mode != "full_duplex" && mode != "turn_based" && mode != "half_duplex") {
+        out.error = "invalid mode: " + mode + " (expected full_duplex, half_duplex or turn_based)";
         return out;
     }
     out.mode = mode;

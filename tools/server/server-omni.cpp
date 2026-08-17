@@ -224,6 +224,38 @@ int main(int argc, char ** argv) {
         res_ok(res, resp);
     });
 
+    // Barge-in: interrupt current generation, keep session alive.
+    svr.Post("/sessions/:session_id/interrupt", [&](const httplib::Request & req, httplib::Response & res) {
+        std::string session_id = req.path_params.at("session_id");
+        LOG_INF("Interrupt requested: %s\n", session_id.c_str());
+
+        auto * session = session_mgr.get(session_id);
+        if (!session || session->state != SessionState::ACTIVE) {
+            res_error(res, format_error_response("session not found", "not_found"));
+            res.status = 404;
+            return;
+        }
+
+        // Signal break (checked every token in decode loop), then unblock the
+        // ws_handler poll loop so it sends a partial response.done and returns
+        // to the read loop. Session stays ACTIVE — ready for the next prefill.
+        if (session->octx) {
+            session->octx->break_event = true;
+            {
+                std::lock_guard<std::mutex> lk(session->octx->text_mtx);
+                session->octx->text_queue.clear();
+                session->octx->text_done_flag = true;
+            }
+            session->octx->text_cv.notify_all();
+        }
+
+        json resp;
+        resp["ok"] = true;
+        resp["session_id"] = session_id;
+        resp["interrupted"] = true;
+        res_ok(res, resp);
+    });
+
     // start server
     LOG_INF("Omni HTTP server listening on 0.0.0.0:%d\n", params.port);
     svr.listen("0.0.0.0", params.port);

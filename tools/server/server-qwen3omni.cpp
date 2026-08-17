@@ -30,6 +30,8 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <atomic>
+#include <unordered_map>
 
 #define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include "httplib.h"
@@ -187,6 +189,10 @@ struct Qwen3Session {
     int resp_cnt = 0;
     int n_ctx = 0;
     int n_keep = 0;
+    int n_past = 0;                    // persistent position (streaming / full_duplex)
+    bool half_duplex = false;          // VAD+TurnSense worker-driven replies
+    bool system_prompt_initialized = false;
+    std::shared_ptr<std::atomic<bool>> interrupt = std::make_shared<std::atomic<bool>>(false); // barge-in flag
     ~Qwen3Session() {
         if (smpl) { common_sampler_free(smpl); smpl = nullptr; }
         if (ctx) { llama_free(ctx); ctx = nullptr; }
@@ -410,7 +416,8 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
                                               int n_past, int n_ctx, int n_keep,
                                               int max_new, llama_token eos,
                                               const std::string & sid, const std::string & rid,
-                                              httplib::ws::WebSocket & ws, bool streaming)
+                                              httplib::ws::WebSocket & ws, bool streaming,
+                                              std::atomic<bool> * interrupt = nullptr)
 {
     common_sampler_reset(smpl);
     std::string full_text;
@@ -424,6 +431,8 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
     };
 
     for (int i = 0; i < max_new; ++i) {
+        if (interrupt && interrupt->load()) { break; }  // barge-in
+
         kv_cache_slide_window(ctx, n_ctx, &n_past, n_keep);
 
         llama_token id = common_sampler_sample(smpl, ctx, -1);
@@ -480,6 +489,30 @@ struct ServerState {
     // Pre-allocated context pool to avoid CUDA fragmentation on second alloc.
     std::vector<llama_context *> ctx_pool;
     std::mutex ctx_pool_mtx;
+
+    // Barge-in interrupt flags, keyed by session_id. Each handle_ws registers its
+    // session's atomic (shared_ptr, so the route can find it even while the
+    // session lives on the WS thread) and unregisters on disconnect.
+    std::mutex interrupt_mtx;
+    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> interrupts;
+
+    void register_interrupt(const std::string & sid,
+                            const std::shared_ptr<std::atomic<bool>> & flag) {
+        flag->store(false);
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        interrupts[sid] = flag;
+    }
+
+    void set_interrupt(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        auto it = interrupts.find(sid);
+        if (it != interrupts.end()) { it->second->store(true); }
+    }
+
+    void unregister_interrupt(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        interrupts.erase(sid);
+    }
 
     ServerState(SharedModel & sm, SharedMmproj & mm, SessionManager & m,
                 const common_params_sampling & sp, bool to, int nb, int ms, int tnc)
@@ -559,6 +592,9 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     if (!parsed_init.ok) { ws.close(); return; }
 
     sess.sid = sid;
+    sess.half_duplex = (parsed_init.mode == "half_duplex" || parsed_init.mode == "full_duplex");
+    state.register_interrupt(sid, sess.interrupt);
+
     // Per-session n_ctx = total_n_ctx / max_sessions (same as MiniCPM).
     // User can override via session.init payload.config.n_ctx.
     int per_session_n_ctx = state.total_n_ctx / state.max_sessions;
@@ -622,6 +658,118 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             eos_tok = llama_vocab_eos(llama_model_get_vocab(state.shared_model.model));
         }
         if (eos_tok == -1) { eos_tok = 151645; }
+
+        // ====================================================================
+        // Half-duplex / full-duplex streaming path (VAD+TurnSense worker-driven)
+        // --------------------------------------------------------------------
+        // The worker streams audio/video chunks with force_listen=true (prefill
+        // only, accumulate into KV). When VAD+TurnSense says the user finished,
+        // the worker sends a chunk WITHOUT force_listen → we decode a full reply.
+        // Barge-in sets sess.interrupt via POST /interrupt; checked each token.
+        // ====================================================================
+        if (sess.half_duplex) {
+            const bool use_mmproj_hd = !state.text_only && state.shared_mmproj.ctx != nullptr;
+            const bool has_audio_hd  = !parsed_input.audio_b64.empty();
+            const bool has_frames_hd = !parsed_input.video_frames_b64.empty();
+
+            // ---- System prompt: prefill once at session start ----
+            if (!sess.system_prompt_initialized) {
+                std::string sys_prompt = parsed_init.system_prompt.empty()
+                    ? "You are a helpful assistant."
+                    : parsed_init.system_prompt;
+                std::string sys_text = "<|im_start|>system\n" + sys_prompt + "<|im_end|>\n";
+                auto vocab_sys = llama_model_get_vocab(state.shared_model.model);
+                auto sys_toks = common_tokenize(vocab_sys, sys_text, true, false);
+                if (!eval_tokens(sess.ctx, sys_toks, state.n_batch, &sess.n_past)) {
+                    fail_fast("eval_failed"); return;
+                }
+                sess.n_keep = sess.n_past;
+                sess.system_prompt_initialized = true;
+            }
+
+            // ---- Stream a media chunk into KV (prefill) ----
+            if (has_audio_hd || has_frames_hd) {
+                if (!use_mmproj_hd) {
+                    fail_fast("mmproj_required"); return;
+                }
+
+                // Build user-turn marker: N media items this chunk
+                int n_media = (has_audio_hd ? 1 : 0) + (int)parsed_input.video_frames_b64.size();
+                std::string user_text = "<|im_start|>user\n";
+                for (int i = 0; i < n_media; i++) { user_text += "<__media__>"; }
+                user_text += "<|im_end|>\n";
+
+                // Build bitmaps: audio first (1), then frames
+                std::vector<mtmd::bitmap_ptr> owned_bmps;
+                std::vector<const mtmd_bitmap *> raw_bmps;
+                owned_bmps.reserve((size_t)n_media);
+                raw_bmps.reserve((size_t)n_media);
+
+                if (has_audio_hd) {
+                    auto bmp = state.shared_mmproj.bitmap_from_audio_b64(parsed_input.audio_b64);
+                    if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                }
+                for (const auto & frame_b64 : parsed_input.video_frames_b64) {
+                    auto bmp = state.shared_mmproj.bitmap_from_image_b64(frame_b64);
+                    if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                }
+
+                mtmd_input_chunks * chunks_raw = mtmd_input_chunks_init();
+                mtmd::input_chunks_ptr chunks(chunks_raw);
+                mtmd_input_text txt;
+                txt.text          = user_text.c_str();
+                txt.add_special   = true;
+                txt.parse_special = false;
+
+                llama_pos new_n_past = sess.n_past;
+                {
+                    std::lock_guard<std::mutex> lock(state.mmproj_mtx);
+                    int32_t ret = mtmd_tokenize(state.shared_mmproj.ctx.get(), chunks_raw,
+                                                &txt, raw_bmps.data(), raw_bmps.size());
+                    if (ret != 0) { fail_fast("mtmd_tokenize_failed"); return; }
+                    // force_listen (accumulate): skip logits (cheaper).
+                    // trigger (decode follows): keep last-token logits for the sampler.
+                    const bool keep_logits = !parsed_input.force_listen;
+                    ret = mtmd_helper_eval_chunks(state.shared_mmproj.ctx.get(), sess.ctx,
+                                                  chunks_raw, new_n_past, 0, state.n_batch,
+                                                  /*logits_last*/keep_logits, &new_n_past);
+                    if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
+                }
+                sess.n_past = (int)new_n_past;
+            }
+
+            // ---- force_listen: prefill only, no decode ----
+            if (parsed_input.force_listen) {
+                ws.send(json_safe_dump(make_listen_delta(sid, rid, ProtocolMetrics{})));
+                continue;
+            }
+
+            // ---- Decode a full reply from current KV ----
+            sess.interrupt->store(false);
+            auto text = generate_tokens_streaming(sess.ctx, sess.smpl, sess.n_past, sess.n_ctx,
+                                                   sess.n_keep, max_new, eos_tok,
+                                                   sid, rid, ws, parsed_input.streaming,
+                                                   sess.interrupt.get());
+            // generate_tokens_streaming advances a local n_past; restore the
+            // authoritative position from the KV cache.
+            {
+                llama_memory_t mem = llama_get_memory(sess.ctx);
+                if (mem) {
+                    llama_pos used = llama_memory_seq_pos_max(mem, 0);
+                    if (used >= 0) { sess.n_past = (int)used + 1; }
+                }
+            }
+            // Ensure the assistant turn boundary for the next user chunk
+            {
+                auto vocab_a = llama_model_get_vocab(state.shared_model.model);
+                auto asst_toks = common_tokenize(vocab_a, "<|im_start|>assistant\n<|im_end|>\n", true, false);
+                if (!eval_tokens(sess.ctx, asst_toks, state.n_batch, &sess.n_past)) {
+                    fail_fast("eval_failed"); return;
+                }
+            }
+            ws.send(json_safe_dump(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{})));
+            continue;
+        }
 
         auto msgs = parse_messages_array(parsed_input.messages);
         if (msgs.empty()) { fail_fast("empty_messages"); return; }
@@ -752,6 +900,7 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
 
     // ---- Cleanup on disconnect ----
     LOG_INF("session %s disconnected\n", sid.c_str());
+    state.unregister_interrupt(sid);
     ws.send(json_safe_dump(make_session_closed(sid, "client_disconnected")));
     state.mgr.close(sid);
 }
@@ -842,6 +991,14 @@ int main(int argc, char ** argv) {
             mgr.close(sid);
         }
         json j = {{"ok",true},{"session_id",sid},{"closed",true}};
+        res.set_content(j.dump(), "application/json");
+    });
+
+    // Barge-in: stop current generation, keep session alive.
+    svr.Post("/sessions/:session_id/interrupt", [&](const httplib::Request & req, httplib::Response & res) {
+        auto sid = req.path_params.at("session_id");
+        state.set_interrupt(sid);
+        json j = {{"ok",true},{"session_id",sid},{"interrupted",true}};
         res.set_content(j.dump(), "application/json");
     });
 
