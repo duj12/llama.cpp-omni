@@ -27,6 +27,7 @@ struct OmniSession {
     omni_context * octx = nullptr;
     bool owns_octx = false;
     double created_at = 0.0;
+    double last_active_at = 0.0;   // last activity (init/input/close); for idle reaping
     std::function<void()> close_ws;
     // Cleanup callback invoked by SessionManager::close().
     // Allows decoupling model-specific cleanup (e.g. omni_free, llama_free)
@@ -50,6 +51,12 @@ public:
 
     // Get a session by id. Returns nullptr if not found.
     OmniSession * get(const std::string & session_id);
+
+    // Mark a session as active (refresh idle timer). Called on init/input.
+    void touch(const std::string & session_id);
+
+    // Close sessions idle for longer than idle_timeout_s. Returns closed ids.
+    std::vector<std::string> reap_idle(double idle_timeout_s);
 
     // Register/trigger transport close without holding the manager lock while
     // invoking the callback.

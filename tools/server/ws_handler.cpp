@@ -731,6 +731,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             return;
         }
 
+        // Refresh the idle timer — the session is alive.
+        session_mgr.touch(session_id);
+
         auto parsed_input = parse_input_append(msg);
         if (!parsed_input.ok) {
             fail_fast(session_id, "invalid_input");

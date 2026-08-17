@@ -51,6 +51,7 @@ std::string SessionManager::allocate() {
     session->session_id = generate_uuid();
     session->state = SessionState::UNINITIALIZED;
     session->created_at = now_seconds();
+    session->last_active_at = session->created_at;
 
     std::string id = session->session_id;
     sessions_[id] = std::move(session);
@@ -71,7 +72,36 @@ bool SessionManager::activate(const std::string & session_id, omni_context * oct
     it->second->octx = octx;
     it->second->owns_octx = owns_octx;
     it->second->state = SessionState::ACTIVE;
+    it->second->last_active_at = now_seconds();
     return true;
+}
+
+void SessionManager::touch(const std::string & session_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = sessions_.find(session_id);
+    if (it != sessions_.end()) {
+        it->second->last_active_at = now_seconds();
+    }
+}
+
+std::vector<std::string> SessionManager::reap_idle(double idle_timeout_s) {
+    // Collect idle session ids (ACTIVE but inactive too long), then close them
+    // outside the manager lock.
+    std::vector<std::string> to_close;
+    double now = now_seconds();
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (const auto & [id, s] : sessions_) {
+            if (s->state == SessionState::ACTIVE &&
+                (now - s->last_active_at) > idle_timeout_s) {
+                to_close.push_back(id);
+            }
+        }
+    }
+    for (const auto & id : to_close) {
+        close(id);
+    }
+    return to_close;
 }
 
 OmniSession * SessionManager::get(const std::string & session_id) {

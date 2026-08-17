@@ -13,9 +13,11 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <atomic>
 #include <condition_variable>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include "httplib.h"
@@ -256,12 +258,30 @@ int main(int argc, char ** argv) {
         res_ok(res, resp);
     });
 
+    // Idle-session reaper: periodically close sessions that have been inactive
+    // too long (e.g. client WS died without clean close). Prevents leaked
+    // sessions from exhausting max_sessions. Idle timeout: 5 minutes.
+    const double idle_timeout_s = 5 * 60.0;
+    std::atomic<bool> reaper_stop{false};
+    std::thread reaper([&]() {
+        while (!reaper_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            auto reaped = session_mgr.reap_idle(idle_timeout_s);
+            if (!reaped.empty()) {
+                LOG_INF("Reaped %zu idle session(s) (timeout %.0fs)\n",
+                        reaped.size(), idle_timeout_s);
+            }
+        }
+    });
+
     // start server
     LOG_INF("Omni HTTP server listening on 0.0.0.0:%d\n", params.port);
     svr.listen("0.0.0.0", params.port);
 
     // cleanup
     LOG_INF("Server shutting down\n");
+    reaper_stop.store(true);
+    if (reaper.joinable()) { reaper.join(); }
     session_mgr.shutdown();
     omni_shared_free(shared_models);
     llama_backend_free();
