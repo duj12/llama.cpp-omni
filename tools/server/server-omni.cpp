@@ -260,12 +260,14 @@ int main(int argc, char ** argv) {
 
     // Idle-session reaper: periodically close sessions that have been inactive
     // too long (e.g. client WS died without clean close). Prevents leaked
-    // sessions from exhausting max_sessions. Idle timeout: 5 minutes.
-    const double idle_timeout_s = 5 * 60.0;
+    // sessions from exhausting max_sessions. Idle timeout: 60s so a leaked
+    // session (e.g. demo client WS died without clean close) is reclaimed
+    // before repeated tests exhaust max_sessions.
+    const double idle_timeout_s = 60.0;
     std::atomic<bool> reaper_stop{false};
     std::thread reaper([&]() {
         while (!reaper_stop.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(30));
+            std::this_thread::sleep_for(std::chrono::seconds(15));
             auto reaped = session_mgr.reap_idle(idle_timeout_s);
             if (!reaped.empty()) {
                 LOG_INF("Reaped %zu idle session(s) (timeout %.0fs)\n",
