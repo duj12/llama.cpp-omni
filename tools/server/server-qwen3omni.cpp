@@ -637,6 +637,9 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             fail_fast("unexpected_message_type"); return;
         }
 
+        // Refresh idle timer — session is alive.
+        state.mgr.touch(sid);
+
         auto parsed_input = parse_input_append(msg);
         if (!parsed_input.ok) { fail_fast("invalid_input"); return; }
 
@@ -737,6 +740,12 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 }
                 sess.n_past = (int)new_n_past;
             }
+
+            // Keep KV within budget while streaming: slide the window when the
+            // accumulated stream (video frames + audio) would otherwise exhaust
+            // the context. Evicts the oldest tokens (after the system prompt),
+            // keeping the most recent stream content.
+            kv_cache_slide_window(sess.ctx, sess.n_ctx, &sess.n_past, sess.n_keep);
 
             // ---- force_listen: prefill only, no decode ----
             if (parsed_input.force_listen) {
@@ -1015,9 +1024,27 @@ int main(int argc, char ** argv) {
     LOG_INF("Qwen3-Omni server on 0.0.0.0:%d (sessions=%d text_only=%d)\n",
             params.port, max_sessions, (int)text_only);
 
+    // Idle-session reaper: periodically close sessions inactive too long
+    // (e.g. client WS died without a clean close). With max_sessions=1 a
+    // single leaked session blocks all new connections.
+    const double idle_timeout_s = 60.0;
+    std::atomic<bool> reaper_stop{false};
+    std::thread reaper([&]() {
+        while (!reaper_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(15));
+            auto reaped = mgr.reap_idle(idle_timeout_s);
+            if (!reaped.empty()) {
+                LOG_INF("Reaped %zu idle session(s) (timeout %.0fs)\n",
+                        reaped.size(), idle_timeout_s);
+            }
+        }
+    });
+
     svr.listen("0.0.0.0", params.port);
 
     LOG_INF("Shutting down\n");
+    reaper_stop.store(true);
+    if (reaper.joinable()) { reaper.join(); }
     mgr.shutdown();
     shared_mmproj.ctx.reset();
     shared_model.free();
