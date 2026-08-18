@@ -746,6 +746,16 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
 
             // ---- Decode a full reply from current KV ----
             sess.interrupt->store(false);
+            // Signal the model it's the assistant's turn to speak: eval the
+            // assistant marker BEFORE decoding. Without this the model sees a
+            // bare user turn and echoes it back instead of replying.
+            {
+                auto vocab_a = llama_model_get_vocab(state.shared_model.model);
+                auto asst_toks = common_tokenize(vocab_a, "<|im_start|>assistant\n", true, false);
+                if (!eval_tokens(sess.ctx, asst_toks, state.n_batch, &sess.n_past)) {
+                    fail_fast("eval_failed"); return;
+                }
+            }
             auto text = generate_tokens_streaming(sess.ctx, sess.smpl, sess.n_past, sess.n_ctx,
                                                    sess.n_keep, max_new, eos_tok,
                                                    sid, rid, ws, parsed_input.streaming,
