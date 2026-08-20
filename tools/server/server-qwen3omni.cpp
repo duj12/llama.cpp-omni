@@ -422,6 +422,7 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
     common_sampler_reset(smpl);
     std::string full_text;
     std::string utf8_pending;
+    std::string im_end_buf;  // accumulate token pieces to catch split <|im_end|>
 
     auto send_delta = [&](const std::string & text) {
         if (!streaming || text.empty()) { return; }
@@ -440,12 +441,40 @@ static std::string generate_tokens_streaming(llama_context * ctx, common_sampler
         if (id == eos || id == 151645) { break; }
 
         std::string piece = common_token_to_piece(ctx, id);
-        if (piece == "<|im_end|>") { break; }
 
-        // Pass through UTF-8 stream buffer — assembles split multi-byte chars
-        std::string safe = sanitize_utf8_stream(utf8_pending, piece);
-        full_text += safe;
-        send_delta(safe);
+        // <|im_end|> may be split across multiple tokens (e.g. text-form
+        // "<|im" + "_end|>"). Buffer pieces; flush only what is confirmed not
+        // to be part of the end marker, so generation stops exactly at
+        // <|im_end|> without leaking it (or anything after) into the stream.
+        im_end_buf += piece;
+        auto pos = im_end_buf.find("<|im_end|>");
+        if (pos != std::string::npos) {
+            // Flush everything before the marker, then stop.
+            std::string before = im_end_buf.substr(0, pos);
+            std::string safe_before = sanitize_utf8_stream(utf8_pending, before);
+            full_text += safe_before;
+            send_delta(safe_before);
+            break;
+        }
+        // Keep the buffer small: only the tail that could become <|im_end|>.
+        if (im_end_buf.size() > 16) { im_end_buf = im_end_buf.substr(im_end_buf.size() - 16); }
+        // How much of im_end_buf could still be a prefix of <|im_end|>?
+        const std::string marker = "<|im_end|>";
+        size_t prefix_len = 0;
+        for (size_t k = 1; k <= im_end_buf.size() && k < marker.size(); k++) {
+            if (marker.compare(0, k, im_end_buf, im_end_buf.size() - k, k) == 0) {
+                prefix_len = k;
+            }
+        }
+        // Flush everything except the possible marker prefix.
+        size_t flush_len = im_end_buf.size() - prefix_len;
+        if (flush_len > 0) {
+            std::string flush = im_end_buf.substr(0, flush_len);
+            im_end_buf.erase(0, flush_len);
+            std::string safe = sanitize_utf8_stream(utf8_pending, flush);
+            full_text += safe;
+            send_delta(safe);
+        }
 
         llama_token batch_tokens[] = {id};
         auto batch = llama_batch_get_one(batch_tokens, 1);
@@ -520,20 +549,13 @@ struct ServerState {
           text_only(to), n_batch(nb), max_sessions(ms), total_n_ctx(tnc) {
         int per_session_n_ctx = total_n_ctx / max_sessions;
         if (per_session_n_ctx < 128) { per_session_n_ctx = 128; }
-        auto cp = llama_context_default_params();
-        cp.n_ctx    = per_session_n_ctx;
-        cp.n_batch  = n_batch;
-        cp.n_ubatch = n_batch;
-        cp.n_seq_max = 1;
-        ctx_pool.resize(max_sessions, nullptr);
-        for (int i = 0; i < max_sessions; i++) {
-            ctx_pool[i] = llama_init_from_model(sm.model, cp);
-            if (!ctx_pool[i]) {
-                LOG_ERR("Failed to pre-allocate context %d/%d\n", i + 1, max_sessions);
-            } else {
-                LOG_INF("Pre-allocated context %d/%d\n", i + 1, max_sessions);
-            }
-        }
+        // NOTE: no pre-allocation. Each session creates its own context via
+        // llama_init_from_model in handle_ws and frees it on disconnect.
+        // Pre-allocating max_sessions contexts doubles GPU VRAM (pool + per-session)
+        // and caused "cudaMalloc failed: out of memory" on the 2nd concurrent init
+        // with a large model (Qwen3-Omni 30B + mmproj already uses ~21GB).
+        // ctx_pool stays empty; borrow_ctx()/return_ctx() are unused for now.
+        ctx_pool.clear();
     }
 
     llama_context * borrow_ctx() {
@@ -803,6 +825,15 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
         const bool has_audio  = !last_user->audio_b64s.empty();
         const bool has_video  = !last_user->video_b64s.empty();
         const bool use_mmproj = !state.text_only && state.shared_mmproj.ctx != nullptr;
+
+        // Turn-based rebuilds the full prompt from the message history every
+        // input. Clear the KV cache first so positions restart cleanly from 0;
+        // otherwise the previous turn's tokens collide (decode: failed to
+        // initialize batch / eval_tokens: llama_decode failed at pos 0).
+        {
+            llama_memory_t mem = llama_get_memory(sess.ctx);
+            if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
+        }
 
         int n_past = 0;
 
