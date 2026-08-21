@@ -767,7 +767,12 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             // accumulated stream (video frames + audio) would otherwise exhaust
             // the context. Evicts the oldest tokens (after the system prompt),
             // keeping the most recent stream content.
-            kv_cache_slide_window(sess.ctx, sess.n_ctx, &sess.n_past, sess.n_keep);
+            // NOTE: no sliding window during prefill. Sliding here discards the
+            // audio/video embedding tokens (keep=20 keeps only the system
+            // prompt), corrupting the context — the model then emits garbage
+            // (e.g. "xxxxx") and stops replying. Long audio should be bounded
+            // with --max-audio-s instead. decode-time sliding (inside
+            // generate_tokens_streaming) still applies as a last resort.
 
             // ---- force_listen: prefill only, no decode ----
             if (parsed_input.force_listen) {
@@ -809,6 +814,18 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 }
             }
             ws.send(json_safe_dump(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{})));
+
+            // 每段回复完成后清理 KV，下一段从干净上下文开始。
+            // 否则多段 turn-based 对话的 KV 持续累积（音频+视频+回复），
+            // 超过 per-session n_ctx 后 "failed to find a memory slot"，
+            // 后续 prefill 失败、连接被关。
+            {
+                llama_memory_t mem = llama_get_memory(sess.ctx);
+                if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
+            }
+            sess.n_past = 0;
+            sess.n_keep = 0;
+            sess.system_prompt_initialized = false;  // 下段重新 prefill 系统 prompt
             continue;
         }
 
@@ -1058,7 +1075,8 @@ int main(int argc, char ** argv) {
     // Idle-session reaper: periodically close sessions inactive too long
     // (e.g. client WS died without a clean close). With max_sessions=1 a
     // single leaked session blocks all new connections.
-    const double idle_timeout_s = 60.0;
+    // 300s: turn-based replies can be long; 60s reclaimed sessions mid-reply.
+    const double idle_timeout_s = 300.0;
     std::atomic<bool> reaper_stop{false};
     std::thread reaper([&]() {
         while (!reaper_stop.load()) {
