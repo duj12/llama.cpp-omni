@@ -374,6 +374,11 @@ ParsedInput parse_input_append(const json & msg) {
         out.force_listen = json_bool(in.at("hints"), "force_listen", out.force_listen);
     }
 
+    out.force_reply = json_bool(in, "force_reply", false);
+    if (in.contains("hints") && in.at("hints").is_object()) {
+        out.force_reply = json_bool(in.at("hints"), "force_reply", out.force_reply);
+    }
+
     // Turn-based fields: messages (required), streaming (required), generation
     if (in.contains("messages") && in.at("messages").is_array()) {
         out.messages = in.at("messages");

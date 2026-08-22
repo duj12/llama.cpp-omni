@@ -1342,7 +1342,18 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
                 float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
                 logits[ctx_omni->special_token_listen] += listen_bias;
             }
-            
+
+            // 1b. 🔧 [VAD+TurnSense] force_reply：本次 decode 的【第一个】采样 token
+            //     强制说话（禁止 <|listen|>，确保模型开口），随后立即清除 force_reply，
+            //     让模型恢复自然采样 —— 后续 token 可采 <|listen|> 或 <|chunk_eos|>，
+            //     从而自然结束回复 / 分块（配合 Python 侧 1s 静音驱动循环）。
+            if (ctx_omni->force_reply) {
+                if (ctx_omni->special_token_listen >= 0) {
+                    logits[ctx_omni->special_token_listen] = -INFINITY;
+                }
+                ctx_omni->force_reply = false;   // ONE-SHOT: 只影响首个采样 token
+            }
+
             // 2. 🔧 [与 Python 对齐] 禁止采样 <|tts_pad|> token
             // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
             //         logits[:, self.forbidden_token_ids] = float("-inf")
@@ -10172,6 +10183,15 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     // duplex 下 llm_generation_done 不重置（与老路径对齐）
     ctx_omni->ended_with_listen = false;
 
+    // 🔧 [VAD+TurnSense] 快照本次 decode 的 force_reply 触发标志。
+    // 注意：这里只快照、不立即清除 — sample_with_hidden_and_token 在解码采样期间
+    // 需要读到它（logit 杀死 <|listen|>）。清除放在本函数所有退出点（force_listen
+    // 早退分支 / 正常 return），确保不泄漏到下一次 decode。
+    bool was_force_reply = ctx_omni->force_reply;
+    if (was_force_reply) {
+        print_with_timestamp("Duplex decode: force_reply triggered (VAD+TurnSense), forcing SPEAK\n");
+    }
+
     if (ctx_omni->break_event.load()) {
         ctx_omni->break_event.store(false);
         print_with_timestamp("Duplex decode: reset break_event at start\n");
@@ -10210,6 +10230,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
+        // 开局 force_listen 分支不进入采样循环，force_reply 无需生效，直接清掉。
+        ctx_omni->force_reply = false;
         return true;
     }
 
@@ -10219,7 +10241,14 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     bool llm_finish                  = false;
     bool local_is_end_of_turn        = false;
     int  current_chunk_tokens        = 0;
-    const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
+    // 🔧 [VAD+TurnSense] 恢复自然 chunk 上限：每个 input.append 一个 chunk
+    // （max_new_speak_tokens_per_chunk 个 token ≈1 秒回复文本）。
+    // 多 chunk 回复由 Python 侧 1s 静音驱动循环提供（每个静音 chunk → 一次 decode
+    // → 一个自然 chunk），而非单次 decode 长跑。force_reply 已一次性化（只保证首
+    // token 开口），后续靠自然采样（<|chunk_eos|> / <|listen|> 结束）。
+    const int max_chunk_tokens       = ctx_omni->duplex_mode
+                                           ? ctx_omni->max_new_speak_tokens_per_chunk
+                                           : ctx_omni->max_new_speak_tokens_per_chunk * 3;
     bool chunk_limit_reached         = false;
     const int llm_n_embd             = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
@@ -10423,6 +10452,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
         n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - n_past_dec_0,
         dec_ms, (int)ctx_omni->ended_with_listen.load());
+    // 本次 decode 结束，清除 force_reply，避免泄漏到下一次 decode。
+    ctx_omni->force_reply = false;
     return true;
 }
 
@@ -11232,7 +11263,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 🔧 [单双工适配] chunk 限制只在双工模式下生效
         // - 双工模式: 每个 chunk 最多 max_new_speak_tokens_per_chunk 个 tokens，便于及时响应打断
         // - 单工模式: 无限制，LLM 生成直到 EOS
-        int max_chunk_tokens = ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
+        // 🔧 [VAD+TurnSense] 恢复自然 chunk 上限（force_reply 已一次性化，多 chunk 由 Python 静音驱动）。
+        int max_chunk_tokens = ctx_omni->duplex_mode
+                                   ? ctx_omni->max_new_speak_tokens_per_chunk
+                                   : ctx_omni->max_new_speak_tokens_per_chunk * 3;
         bool chunk_limit_reached = (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens);
         {
             fflush(stdout);
@@ -11345,7 +11379,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 
                 if (is_end_token(ctx_omni, sampled_token)){
                     llm_finish = true;
-                    
+
                     // 🔧 [与 Python 对齐] 设置 llm_generation_done 标志
                     // TTS 线程会检查这个标志来决定是否添加 text_eos_embed
                     if (!ctx_omni->duplex_mode) ctx_omni->llm_generation_done.store(true);
@@ -11704,7 +11738,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // clean_kvcache(ctx_omni);
         // eval_prefix(ctx_omni, ctx_omni->params);
     }
-    
+
+    // 🔧 [VAD+TurnSense] legacy stream_decode 路径（非 duplex pipeline）结束，
+    // 清除 force_reply，避免泄漏到下一次 decode（与 duplex_do_decode 一致）。
+    ctx_omni->force_reply = false;
+
     return true;
 }
 

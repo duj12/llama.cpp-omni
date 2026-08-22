@@ -1081,6 +1081,11 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 continue;
             }
 
+            // VAD+TurnSense trigger: force this decode to SPEAK.
+            // Set before starting decode_thread; consumed by sample_with_hidden_and_token
+            // and duplex_do_decode; cleared when stream_decode / duplex_do_decode finishes.
+            octx->force_reply = parsed_input.force_reply;
+
             // Decode: start background thread, poll text_queue on this thread
             std::string debug_dir = session_output_dir;
 
@@ -1182,7 +1187,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 std::lock_guard<std::mutex> lk(audio_state->mtx);
                 emitted_audio = audio_state->emitted_audio;
             }
-            if (!full_text.empty() || emitted_audio) {
+            // force_reply: a VAD+TurnSense trigger MUST produce an explicit
+            // completion boundary so the worker's half-duplex state machine
+            // resets even in the (now impossible) silent-listen case.
+            // With the sampler-level fix, full_text/emitted_audio are already
+            // non-empty; this clause is a defensive belt-and-suspenders.
+            if (parsed_input.force_reply || !full_text.empty() || emitted_audio) {
                 // Full-duplex speak responses also need an explicit completion
                 // boundary; pure listen steps are represented by listen delta only.
                 send_event(make_response_done(

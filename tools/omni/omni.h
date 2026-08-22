@@ -391,6 +391,12 @@ struct omni_context {
     int force_listen_count = 3;
     int force_listen_used  = 0;
 
+    // VAD+TurnSense 触发回复：本次 decode 必须说话（禁止采样 <|listen|>）。
+    // ws_handler 在触发 chunk（force_reply=true，不带 force_listen）置 true；
+    // 解码采样期间由 sample_with_hidden_and_token / duplex_do_decode 读取，
+    // stream_decode 解码结束后清回 false。仅双工模式使用。
+    bool force_reply = false;
+
     // TTS 采样温度（与 Python TTSSamplingParams.temperature 对齐，默认 0.8）
     // 通过 /v1/stream/update_session_config 的 "tts_temperature" 字段透传
     float tts_temperature = 0.8f;

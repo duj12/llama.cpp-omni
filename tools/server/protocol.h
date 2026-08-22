@@ -105,6 +105,7 @@ struct ParsedInput {
     std::vector<std::string> video_frames_b64;     // base64 JPEG frames
     int max_slice_nums = -1;
     bool force_listen = false;            // full_duplex: force this step to LISTEN
+    bool force_reply  = false;            // full_duplex: force this step to SPEAK (VAD+TurnSense trigger)
 
     // Turn-based fields
     bool streaming = true;
