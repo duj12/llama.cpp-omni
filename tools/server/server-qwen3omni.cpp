@@ -1,11 +1,18 @@
 // Qwen3-Omni HTTP/WebSocket server — turn-based multimodal inference.
 //
+// Uses the shared batch executor (server-context.cpp) so multiple WebSocket
+// sessions share one llama_context + one mtmd_context and are batched into
+// the same llama_decode calls. Each session pins a server_slot (seq_id) and
+// posts SERVER_TASK_TYPE_OMNI_STREAM tasks; results stream back over the
+// /backend WebSocket protocol.
+//
 // Supports:
 //   - Text-only mode (--text-only flag, no mmproj needed)
 //   - Vision input (JPEG/PNG images via mmproj)
 //   - Audio input (float32 PCM via mmproj -> WAV wrapper)
 //   - Qwen3 ChatML template with <__media__> markers
 //   - Streaming text output via WebSocket /backend protocol
+//   - half_duplex / full_duplex (VAD+TurnSense) force_listen prefill + trigger decode
 //
 // Build:   cmake --build . --target llama-qwen3omni-server
 // Run:     ./llama-qwen3omni-server -m model.gguf --mmproj mmproj.gguf
@@ -18,6 +25,9 @@
 #include "session.h"
 #include "protocol.h"
 
+#include "server-context.h"
+#include "server-task.h"
+
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -28,10 +38,13 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <atomic>
 #include <unordered_map>
+#include <map>
+#include <thread>
 
 #define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
 #include "httplib.h"
@@ -104,6 +117,13 @@ struct ExtractedVideoMedia {
     std::string audio_path;
     std::vector<std::string> frame_paths;
 };
+
+static std::vector<uint8_t> read_file_bytes(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { return {}; }
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+}
 
 // Decode base64 MP4 to temp file, extract N JPEG frames + audio WAV via ffmpeg.
 static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64,
@@ -179,97 +199,96 @@ static ExtractedVideoMedia extract_video_mp4_media(const std::string & video_b64
 }
 
 // ============================================================================
-// Per-session state (stack-allocated per WebSocket connection)
+// Per-session state
 // ============================================================================
 
 struct Qwen3Session {
-    llama_context  * ctx  = nullptr;
-    common_sampler * smpl = nullptr;
     std::string sid;
+    int slot = -1;                       // pinned server_slot (seq_id)
     int resp_cnt = 0;
-    int n_ctx = 0;
-    int n_keep = 0;
-    int n_past = 0;                    // persistent position (streaming / full_duplex)
-    bool half_duplex = false;          // VAD+TurnSense worker-driven replies
-    bool system_prompt_initialized = false;
+    bool half_duplex = false;            // VAD+TurnSense worker-driven replies
     std::shared_ptr<std::atomic<bool>> interrupt = std::make_shared<std::atomic<bool>>(false); // barge-in flag
-    ~Qwen3Session() {
-        if (smpl) { common_sampler_free(smpl); smpl = nullptr; }
-        if (ctx) { llama_free(ctx); ctx = nullptr; }
+
+    // half-duplex: cumulative prompt text + media bytes so far (for this turn).
+    // Each force_listen task carries the full cumulative prompt so the shared
+    // executor's prefix-reuse (chunk-hash) only evals the newly added media.
+    std::string cumulative_prompt;
+    std::vector<raw_buffer> cumulative_files;
+    bool pending_reset = true;           // next task clears the slot KV (start of a fresh turn)
+};
+
+// ============================================================================
+// Server state
+// ============================================================================
+
+struct ServerState {
+    server_context ctx_server;
+    SessionManager & mgr;
+    common_params & params;
+    bool text_only;
+    int max_sessions;
+
+    // session_id -> pinned slot index
+    std::mutex slot_mtx;
+    std::map<std::string, int> session_slots;
+
+    // Barge-in interrupt flags, keyed by session_id. Each handle_ws registers its
+    // session's atomic (shared_ptr, so the route can find it even while the
+    // session lives on the WS thread) and unregisters on disconnect.
+    std::mutex interrupt_mtx;
+    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> interrupts;
+
+    void register_interrupt(const std::string & sid,
+                            const std::shared_ptr<std::atomic<bool>> & flag) {
+        flag->store(false);
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        interrupts[sid] = flag;
+    }
+
+    void set_interrupt(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        auto it = interrupts.find(sid);
+        if (it != interrupts.end()) { it->second->store(true); }
+    }
+
+    void unregister_interrupt(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(interrupt_mtx);
+        interrupts.erase(sid);
+    }
+
+    // Allocate a stable slot for a session. Returns -1 if all slots are taken.
+    int alloc_slot(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(slot_mtx);
+        if (session_slots.find(sid) != session_slots.end()) {
+            return session_slots[sid];
+        }
+        if ((int) session_slots.size() >= max_sessions) {
+            return -1;
+        }
+        int slot = (int) session_slots.size();
+        session_slots[sid] = slot;
+        return slot;
+    }
+
+    void free_slot(const std::string & sid) {
+        std::lock_guard<std::mutex> lock(slot_mtx);
+        session_slots.erase(sid);
+    }
+
+    ServerState(SessionManager & m, common_params & p, bool to)
+        : mgr(m), params(p), text_only(to) {
+        max_sessions = p.n_parallel > 0 ? p.n_parallel : 4;
     }
 };
 
 // ============================================================================
-// Shared mmproj — loaded once at startup
+// Prompt builders
 // ============================================================================
 
-struct SharedMmproj {
-    mtmd::context_ptr ctx;
-
-    bool load(const std::string & path, const llama_model * text_model, int n_threads, bool use_gpu) {
-        auto p = mtmd_context_params_default();
-        p.use_gpu    = use_gpu;
-        p.n_threads  = n_threads;
-        p.warmup     = true;
-        auto * raw = mtmd_init_from_file(path.c_str(), text_model, p);
-        if (!raw) { return false; }
-        ctx.reset(raw);
-        LOG_INF("mmproj loaded: vision=%d audio=%d\n",
-                (int)mtmd_support_vision(raw), (int)mtmd_support_audio(raw));
-        return true;
-    }
-
-    bool has_vision() const { return ctx && mtmd_support_vision(ctx.get()); }
-    bool has_audio()  const { return ctx && mtmd_support_audio(ctx.get());  }
-
-    mtmd::bitmap_ptr bitmap_from_image_b64(const std::string & b64) const {
-        auto raw = b64_decode(b64);
-        if (raw.empty()) { return nullptr; }
-        auto * bmp = mtmd_helper_bitmap_init_from_buf(ctx.get(), raw.data(), raw.size());
-        return mtmd::bitmap_ptr(bmp);
-    }
-
-    mtmd::bitmap_ptr bitmap_from_audio_b64(const std::string & b64) const {
-        auto pcm = b64_to_float32_pcm(b64);
-        if (pcm.empty()) { return nullptr; }
-        auto wav = build_wav_from_pcm(pcm);
-        if (wav.empty()) { return nullptr; }
-        auto * bmp = mtmd_helper_bitmap_init_from_buf(ctx.get(), wav.data(), wav.size());
-        return mtmd::bitmap_ptr(bmp);
-    }
-
-    mtmd::bitmap_ptr bitmap_from_file(const std::string & path) const {
-        auto * bmp = mtmd_helper_bitmap_init_from_file(ctx.get(), path.c_str());
-        return mtmd::bitmap_ptr(bmp);
-    }
-};
-
-// ============================================================================
-// Shared text model
-// ============================================================================
-
-struct SharedModel {
-    llama_model * model = nullptr;
-
-    bool load(const std::string & path, const common_params & params) {
-        LOG_INF("Loading GGUF: %s\n", path.c_str());
-        auto mparams = common_model_params_to_llama(const_cast<common_params&>(params));
-        model = llama_model_load_from_file(path.c_str(), mparams);
-        if (!model) { LOG_ERR("load failed\n"); return false; }
-        char buf[128];
-        llama_model_desc(model, buf, sizeof(buf));
-        LOG_INF("Loaded: %s\n", buf);
-        return true;
-    }
-
-    void free() { if (model) { llama_model_free(model); model = nullptr; } }
-    ~SharedModel() { free(); }
-};
-
-// ============================================================================
-// Qwen3 ChatML prompt builder with <__media__> markers
-// ============================================================================
-
+// Qwen3 ChatML prompt with <__media__> markers for the shared executor.
+// NOTE: the executor tokenizes with parse_special=true (canonical 151644/151645),
+// which the model was trained on. The old per-session server split these into
+// byte tokens (parse_special=false) which degraded generation.
 static std::string build_qwen3_prompt(const std::vector<ParsedMessage> & msgs,
                                       const ParsedMessage * last_user,
                                       int n_media_markers)
@@ -311,278 +330,83 @@ static std::string build_qwen3_prompt(const std::vector<ParsedMessage> & msgs,
 }
 
 // ============================================================================
-// Text eval helpers (batch with position handling)
+// Shared executor task helpers
 // ============================================================================
 
-static bool eval_tokens(llama_context * ctx, const std::vector<llama_token> & tokens,
-                        int n_batch, int * n_past)
+// Post an OMNI_STREAM task to the shared executor and stream its events back
+// to the /backend WS as protocol events. Returns true if the turn completed
+// normally (DONE/PREFILL_DONE), false on error.
+//
+// force_listen = true  -> prefill only (PREFILL_DONE event, no generation)
+// force_listen = false -> decode a full reply (TEXT_DELTA... then DONE)
+static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
+                          Qwen3Session & sess, const std::string & rid,
+                          std::string prompt, std::vector<raw_buffer> files,
+                          bool force_listen, int max_new, bool streaming)
 {
-    for (int i = 0; i < (int)tokens.size(); i += n_batch) {
-        int n_eval = (int)tokens.size() - i;
-        if (n_eval > n_batch) { n_eval = n_batch; }
+    server_task task(SERVER_TASK_TYPE_OMNI_STREAM);
+    task.id_slot   = sess.slot;
+    task.cli       = true;
+    task.cli_prompt = std::move(prompt);
+    task.cli_files  = std::move(files);
 
-        auto batch = llama_batch_get_one(const_cast<llama_token*>(&tokens[i]), n_eval);
-        if (batch.pos == nullptr) {
-            static thread_local std::vector<llama_pos> s_pos;
-            s_pos.resize(n_eval);
-            batch.pos = s_pos.data();
-        }
-        for (int j = 0; j < n_eval; j++) {
-            batch.pos[j] = *n_past + j;
-        }
+    task.params               = task_params();      // defaults
+    task.params.sampling      = state.params.sampling;
+    task.params.stream        = streaming;
+    task.params.n_predict     = max_new;
+    task.params.force_listen  = force_listen;
+    task.params.reset_kv      = sess.pending_reset;
+    sess.pending_reset        = false;
 
-        if (llama_decode(ctx, batch)) {
-            LOG_ERR("eval_tokens: llama_decode failed at pos %d\n", *n_past);
-            return false;
-        }
-        *n_past += n_eval;
-    }
-    return true;
-}
+    server_response_reader rd = state.ctx_server.get_response_reader();
+    task.id = rd.get_new_id();                     // required: queue.post() asserts id != -1
+    rd.post_task(std::move(task));
 
-// ============================================================================
-// UTF-8 safe streaming helpers (defined before usage in streaming generator)
-// ============================================================================
+    bool done   = false;
+    bool error  = false;
+    std::string partial_text;
 
-static bool utf8_is_cont(unsigned char b) {
-    return (b & 0xC0) == 0x80;
-}
-
-static std::vector<std::string> utf8_safe_chunks(const std::string & text, size_t target) {
-    std::vector<std::string> chunks;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        size_t end = std::min(pos + target, text.size());
-        while (end < text.size() && utf8_is_cont((unsigned char)text[end])) { end++; }
-        chunks.push_back(text.substr(pos, end - pos));
-        pos = end;
-    }
-    return chunks;
-}
-
-// ============================================================================
-// KV cache sliding window (keep system prompt, evict oldest tokens)
-// ============================================================================
-
-static void kv_cache_slide_window(llama_context * ctx, int n_ctx, int * n_past, int n_keep) {
-    const int slack = 512;
-    if (*n_past + 1 < n_ctx - slack) { return; }
-    if (n_keep <= 0) { return; }
-
-    int n_discard = std::max(16, *n_past - n_keep - (n_ctx / 4));
-    llama_memory_t mem = llama_get_memory(ctx);
-    if (mem) {
-        llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard);
-    }
-    *n_past -= n_discard;
-    LOG_INF("sliding window: n_past -> %d (keep=%d)\n", *n_past, n_keep);
-}
-
-// UTF-8 stream sanitizer (from ws_handler.cpp) — buffers incomplete multi-byte
-// sequences across tokens so nlohmann::json::dump() never sees partial characters.
-static std::string sanitize_utf8_stream(std::string & pending,
-                                        const std::string & fragment,
-                                        bool flush = false) {
-    static const std::string replacement = "\xEF\xBF\xBD";
-    std::string input = pending + fragment;
-    pending.clear();
-    std::string out;
-    size_t i = 0;
-    while (i < input.size()) {
-        const unsigned char c = static_cast<unsigned char>(input[i]);
-        if (c < 0x80) { out.push_back(static_cast<char>(c)); i++; continue; }
-        int need = 0;
-        if (c >= 0xC2 && c <= 0xDF)       { need = 1; }
-        else if (c >= 0xE0 && c <= 0xEF)  { need = 2; }
-        else if (c >= 0xF0 && c <= 0xF4)  { need = 3; }
-        else { out += replacement; i++; continue; }
-        if (i + need >= input.size()) { pending = input.substr(i); break; }
-        bool ok = true;
-        for (int j = 1; j <= need; ++j) { ok = ok && utf8_is_cont((unsigned char)input[i + j]); }
-        if (!ok) { out += replacement; i++; continue; }
-        out.append(input, i, need + 1);
-        i += need + 1;
-    }
-    if (flush && !pending.empty()) { out += replacement; pending.clear(); }
-    return out;
-}
-
-// ============================================================================
-// True streaming generation — sends text deltas inline as tokens decode.
-// Returns accumulated text (with <|im_end|> stripped) for response.done.
-// ============================================================================
-
-static std::string generate_tokens_streaming(llama_context * ctx, common_sampler * smpl,
-                                              int n_past, int n_ctx, int n_keep,
-                                              int max_new, llama_token eos,
-                                              const std::string & sid, const std::string & rid,
-                                              httplib::ws::WebSocket & ws, bool streaming,
-                                              std::atomic<bool> * interrupt = nullptr)
-{
-    common_sampler_reset(smpl);
-    std::string full_text;
-    std::string utf8_pending;
-    std::string im_end_buf;  // accumulate token pieces to catch split <|im_end|>
-
-    auto send_delta = [&](const std::string & text) {
-        if (!streaming || text.empty()) { return; }
-        for (const auto & ch : utf8_safe_chunks(text, 4)) {
-            ws.send(json_safe_dump(make_text_delta(sid, rid, ch, ProtocolMetrics{})));
-        }
-    };
-
-    for (int i = 0; i < max_new; ++i) {
-        if (interrupt && interrupt->load()) { break; }  // barge-in
-
-        kv_cache_slide_window(ctx, n_ctx, &n_past, n_keep);
-
-        llama_token id = common_sampler_sample(smpl, ctx, -1);
-        common_sampler_accept(smpl, id, true);
-        if (id == eos || id == 151645) { break; }
-
-        std::string piece = common_token_to_piece(ctx, id);
-
-        // <|im_end|> may be split across multiple tokens (e.g. text-form
-        // "<|im" + "_end|>"). Buffer pieces; flush only what is confirmed not
-        // to be part of the end marker, so generation stops exactly at
-        // <|im_end|> without leaking it (or anything after) into the stream.
-        im_end_buf += piece;
-        auto pos = im_end_buf.find("<|im_end|>");
-        if (pos != std::string::npos) {
-            // Flush everything before the marker, then stop.
-            std::string before = im_end_buf.substr(0, pos);
-            std::string safe_before = sanitize_utf8_stream(utf8_pending, before);
-            full_text += safe_before;
-            send_delta(safe_before);
+    while (auto res = rd.next([&]() { return sess.interrupt->load(); })) {
+        if (res->is_error()) {
+            error = true;
+            json err = res->to_json();
+            ws.send(json_safe_dump(make_session_closed(sess.sid,
+                "executor_error", err.contains("message") ? err["message"].get<std::string>() : err.dump())));
             break;
         }
-        // Keep the buffer small: only the tail that could become <|im_end|>.
-        if (im_end_buf.size() > 16) { im_end_buf = im_end_buf.substr(im_end_buf.size() - 16); }
-        // How much of im_end_buf could still be a prefix of <|im_end|>?
-        const std::string marker = "<|im_end|>";
-        size_t prefix_len = 0;
-        for (size_t k = 1; k <= im_end_buf.size() && k < marker.size(); k++) {
-            if (marker.compare(0, k, im_end_buf, im_end_buf.size() - k, k) == 0) {
-                prefix_len = k;
-            }
+        auto omni = dynamic_cast<server_task_result_omni_stream *>(res.get());
+        if (!omni) { continue; }
+        switch (omni->event) {
+            case server_task_result_omni_stream::Event::PREFILL_DONE:
+                // force_listen 任务完成：只累积 prefill，无回复。
+                ws.send(json_safe_dump(make_listen_delta(sess.sid, rid, ProtocolMetrics{})));
+                done = true;
+                break;
+            case server_task_result_omni_stream::Event::TEXT_DELTA:
+                partial_text += omni->text_delta;
+                ws.send(json_safe_dump(make_text_delta(sess.sid, rid, omni->text_delta, ProtocolMetrics{})));
+                break;
+            case server_task_result_omni_stream::Event::DONE:
+                ws.send(json_safe_dump(make_response_done(sess.sid, rid, omni->full_text, "", "turn_end", ProtocolMetrics{})));
+                done = true;
+                break;
+            default:
+                break;
         }
-        // Flush everything except the possible marker prefix.
-        size_t flush_len = im_end_buf.size() - prefix_len;
-        if (flush_len > 0) {
-            std::string flush = im_end_buf.substr(0, flush_len);
-            im_end_buf.erase(0, flush_len);
-            std::string safe = sanitize_utf8_stream(utf8_pending, flush);
-            full_text += safe;
-            send_delta(safe);
-        }
-
-        llama_token batch_tokens[] = {id};
-        auto batch = llama_batch_get_one(batch_tokens, 1);
-        if (batch.pos == nullptr) {
-            static thread_local std::vector<llama_pos> s_pos(1);
-            batch.pos = s_pos.data();
-        }
-        batch.pos[0] = n_past++;
-        if (llama_decode(ctx, batch)) { break; }
+        if (done || error) { break; }
     }
 
-    // Flush remaining incomplete UTF-8
-    std::string tail = sanitize_utf8_stream(utf8_pending, "", true);
-    full_text += tail;
-    send_delta(tail);
-
-    // Strip <|im_end|> and ensure valid UTF-8 for json::dump()
-    auto pos = full_text.find("<|im_end|>");
-    if (pos != std::string::npos) { full_text.resize(pos); }
-    {
-        std::string dummy;
-        full_text = sanitize_utf8_stream(dummy, full_text, true);
+    if (!done && !error) {
+        // 循环退出但未收到 DONE → barge-in 中断。reader 析构时会 post CANCEL
+        // 释放 slot；这里向客户端补发 response.done（reason=interrupted），
+        // 下一轮 input 从干净 KV 开始。
+        LOG_INF("session %s: task interrupted (rid=%s)\n", sess.sid.c_str(), rid.c_str());
+        sess.pending_reset = true;
+        ws.send(json_safe_dump(make_response_done(sess.sid, rid, partial_text, "", "interrupted", ProtocolMetrics{})));
     }
-    return full_text;
+
+    return !error;
 }
-
-// ============================================================================
-// Server state
-// ============================================================================
-
-struct ServerState {
-    SharedModel  & shared_model;
-    SharedMmproj & shared_mmproj;
-    SessionManager & mgr;
-    common_params_sampling sampling;
-    bool text_only;
-    int  n_batch;
-    int  max_sessions;
-    int  total_n_ctx;
-    std::mutex mmproj_mtx;
-    // Pre-allocated context pool to avoid CUDA fragmentation on second alloc.
-    std::vector<llama_context *> ctx_pool;
-    std::mutex ctx_pool_mtx;
-
-    // Barge-in interrupt flags, keyed by session_id. Each handle_ws registers its
-    // session's atomic (shared_ptr, so the route can find it even while the
-    // session lives on the WS thread) and unregisters on disconnect.
-    std::mutex interrupt_mtx;
-    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> interrupts;
-
-    void register_interrupt(const std::string & sid,
-                            const std::shared_ptr<std::atomic<bool>> & flag) {
-        flag->store(false);
-        std::lock_guard<std::mutex> lock(interrupt_mtx);
-        interrupts[sid] = flag;
-    }
-
-    void set_interrupt(const std::string & sid) {
-        std::lock_guard<std::mutex> lock(interrupt_mtx);
-        auto it = interrupts.find(sid);
-        if (it != interrupts.end()) { it->second->store(true); }
-    }
-
-    void unregister_interrupt(const std::string & sid) {
-        std::lock_guard<std::mutex> lock(interrupt_mtx);
-        interrupts.erase(sid);
-    }
-
-    ServerState(SharedModel & sm, SharedMmproj & mm, SessionManager & m,
-                const common_params_sampling & sp, bool to, int nb, int ms, int tnc)
-        : shared_model(sm), shared_mmproj(mm), mgr(m), sampling(sp),
-          text_only(to), n_batch(nb), max_sessions(ms), total_n_ctx(tnc) {
-        int per_session_n_ctx = total_n_ctx / max_sessions;
-        if (per_session_n_ctx < 128) { per_session_n_ctx = 128; }
-        // NOTE: no pre-allocation. Each session creates its own context via
-        // llama_init_from_model in handle_ws and frees it on disconnect.
-        // Pre-allocating max_sessions contexts doubles GPU VRAM (pool + per-session)
-        // and caused "cudaMalloc failed: out of memory" on the 2nd concurrent init
-        // with a large model (Qwen3-Omni 30B + mmproj already uses ~21GB).
-        // ctx_pool stays empty; borrow_ctx()/return_ctx() are unused for now.
-        ctx_pool.clear();
-    }
-
-    llama_context * borrow_ctx() {
-        std::lock_guard<std::mutex> lock(ctx_pool_mtx);
-        for (auto & ctx : ctx_pool) {
-            if (ctx) { auto * r = ctx; ctx = nullptr; return r; }
-        }
-        return nullptr;
-    }
-
-    void return_ctx(llama_context * ctx) {
-        if (!ctx) return;
-        {
-            llama_memory_t mem = llama_get_memory(ctx);
-            if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
-        }
-        std::lock_guard<std::mutex> lock(ctx_pool_mtx);
-        for (auto & slot : ctx_pool) {
-            if (slot == nullptr) { slot = ctx; return; }
-        }
-        llama_free(ctx);
-    }
-
-    ~ServerState() {
-        for (auto ctx : ctx_pool) { if (ctx) llama_free(ctx); }
-    }
-};
 
 // ============================================================================
 // WebSocket /backend handler
@@ -594,12 +418,22 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     state.mgr.set_close_callback(sid, [&ws]() { ws.close(); });
 
     Qwen3Session sess;
+    sess.sid = sid;
+    sess.slot = state.alloc_slot(sid);
+    if (sess.slot < 0) {
+        LOG_ERR("session %s: no free executor slot (max_sessions=%d)\n", sid.c_str(), state.max_sessions);
+        ws.send(json_safe_dump(make_session_closed(sid, "no_free_slot")));
+        state.mgr.close(sid);
+        ws.close();
+        return;
+    }
 
     auto fail_fast = [&](const std::string & reason) {
         if (!sid.empty()) {
             ws.send(json_safe_dump(make_session_closed(sid, reason)));
         }
         state.mgr.close(sid);
+        state.free_slot(sid);
         ws.close();
     };
 
@@ -613,34 +447,22 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     auto parsed_init = parse_session_init(first_msg);
     if (!parsed_init.ok) { ws.close(); return; }
 
-    sess.sid = sid;
     sess.half_duplex = (parsed_init.mode == "half_duplex" || parsed_init.mode == "full_duplex");
     state.register_interrupt(sid, sess.interrupt);
 
-    // Per-session n_ctx = total_n_ctx / max_sessions (same as MiniCPM).
-    // User can override via session.init payload.config.n_ctx.
-    int per_session_n_ctx = state.total_n_ctx / state.max_sessions;
-    if (per_session_n_ctx < 128) { per_session_n_ctx = 128; }
-    int nc = parsed_init.config.contains("n_ctx") ? parsed_init.config["n_ctx"].get<int>()
-             : per_session_n_ctx;
-    LOG_INF("session %s: n_ctx=%d (total=%d max_sessions=%d)\n",
-            sid.c_str(), nc, state.total_n_ctx, state.max_sessions);
-
-    auto cp = llama_context_default_params();
-    cp.n_ctx    = nc;
-    cp.n_batch  = state.n_batch;
-    cp.n_ubatch = state.n_batch;
-    cp.n_seq_max = 1;
-    sess.ctx = llama_init_from_model(state.shared_model.model, cp);
-    if (!sess.ctx) { fail_fast("ctx_init_failed"); return; }
-    sess.n_ctx = nc;
-
-    sess.smpl = common_sampler_init(state.shared_model.model, state.sampling);
-    if (!sess.smpl) { fail_fast("sampler_init_failed"); return; }
+    LOG_INF("session %s started (slot=%d, mode=%s, text_only=%d)\n",
+            sid.c_str(), sess.slot, parsed_init.mode.c_str(), (int) state.text_only);
 
     state.mgr.activate(sid, nullptr, false);
     ws.send(json_safe_dump(make_session_created(sid, parsed_init.mode)));
-    LOG_INF("session %s started (text_only=%d)\n", sid.c_str(), (int)state.text_only);
+
+    // System prompt block, prefilled once per turn (included in every
+    // cumulative-prompt task; prefix-reuse keeps it cached in KV).
+    const std::string sys_prompt = parsed_init.system_prompt.empty()
+        ? "You are a helpful assistant."
+        : parsed_init.system_prompt;
+    const std::string sys_text = "<|im_start|>system\n" + sys_prompt + "<|im_end|>\n";
+    sess.cumulative_prompt = sys_text;  // every turn starts with the system block
 
     // ---- Read loop: input.append ----
     while (true) {
@@ -668,167 +490,82 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
         std::string rid = sid + "-" + std::to_string(++sess.resp_cnt);
         int max_new = parsed_input.max_new_tokens > 0 ? parsed_input.max_new_tokens : 512;
 
-        // Determine the EOS token. For Qwen3 the correct EOS is <|im_end|> (151645).
-        // llama_vocab_eos() may return the wrong token (</s> = 128247) if the GGUF
-        // overrides it. Look up <|im_end|> in the vocabulary explicitly.
-        llama_token eos_tok = -1;
-        {
-            auto vocab = llama_model_get_vocab(state.shared_model.model);
-            auto im_end_toks = common_tokenize(vocab, "<|im_end|>", false, true);
-            if (im_end_toks.size() == 1) {
-                eos_tok = im_end_toks[0];
-            }
-        }
-        if (eos_tok == -1) {
-            eos_tok = llama_vocab_eos(llama_model_get_vocab(state.shared_model.model));
-        }
-        if (eos_tok == -1) { eos_tok = 151645; }
-
         // ====================================================================
         // Half-duplex / full-duplex streaming path (VAD+TurnSense worker-driven)
         // --------------------------------------------------------------------
         // The worker streams audio/video chunks with force_listen=true (prefill
-        // only, accumulate into KV). When VAD+TurnSense says the user finished,
-        // the worker sends a chunk WITHOUT force_listen → we decode a full reply.
-        // Barge-in sets sess.interrupt via POST /interrupt; checked each token.
+        // only, accumulate into shared KV via prefix-reuse). When VAD+TurnSense
+        // says the user finished, the worker sends a chunk WITHOUT force_listen
+        // → we decode a full reply. Barge-in sets sess.interrupt via POST
+        // /interrupt; checked by server_response_reader.next()'s should_stop.
         // ====================================================================
         if (sess.half_duplex) {
-            const bool use_mmproj_hd = !state.text_only && state.shared_mmproj.ctx != nullptr;
             const bool has_audio_hd  = !parsed_input.audio_b64.empty();
             const bool has_frames_hd = !parsed_input.video_frames_b64.empty();
 
-            // ---- System prompt: prefill once at session start ----
-            if (!sess.system_prompt_initialized) {
-                std::string sys_prompt = parsed_init.system_prompt.empty()
-                    ? "You are a helpful assistant."
-                    : parsed_init.system_prompt;
-                std::string sys_text = "<|im_start|>system\n" + sys_prompt + "<|im_end|>\n";
-                auto vocab_sys = llama_model_get_vocab(state.shared_model.model);
-                auto sys_toks = common_tokenize(vocab_sys, sys_text, true, false);
-                if (!eval_tokens(sess.ctx, sys_toks, state.n_batch, &sess.n_past)) {
-                    fail_fast("eval_failed"); return;
-                }
-                sess.n_keep = sess.n_past;
-                sess.system_prompt_initialized = true;
-            }
-
-            // ---- Stream a media chunk into KV (prefill) ----
-            if (has_audio_hd || has_frames_hd) {
-                if (!use_mmproj_hd) {
-                    fail_fast("mmproj_required"); return;
-                }
-
-                // Build user-turn marker: N media items this chunk
-                int n_media = (has_audio_hd ? 1 : 0) + (int)parsed_input.video_frames_b64.size();
-                std::string user_text = "<|im_start|>user\n";
+            // ---- Append the new media chunk to the cumulative prompt ----
+            int n_media = (has_audio_hd ? 1 : 0) + (int)parsed_input.video_frames_b64.size();
+            std::string user_text;
+            if (n_media > 0) {
+                user_text = "<|im_start|>user\n";
                 for (int i = 0; i < n_media; i++) { user_text += "<__media__>"; }
                 user_text += "<|im_end|>\n";
-
-                // Build bitmaps: audio first (1), then frames
-                std::vector<mtmd::bitmap_ptr> owned_bmps;
-                std::vector<const mtmd_bitmap *> raw_bmps;
-                owned_bmps.reserve((size_t)n_media);
-                raw_bmps.reserve((size_t)n_media);
-
-                if (has_audio_hd) {
-                    auto bmp = state.shared_mmproj.bitmap_from_audio_b64(parsed_input.audio_b64);
-                    if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
-                }
-                for (const auto & frame_b64 : parsed_input.video_frames_b64) {
-                    auto bmp = state.shared_mmproj.bitmap_from_image_b64(frame_b64);
-                    if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
-                }
-
-                mtmd_input_chunks * chunks_raw = mtmd_input_chunks_init();
-                mtmd::input_chunks_ptr chunks(chunks_raw);
-                mtmd_input_text txt;
-                txt.text          = user_text.c_str();
-                txt.add_special   = true;
-                txt.parse_special = false;
-
-                llama_pos new_n_past = sess.n_past;
-                {
-                    std::lock_guard<std::mutex> lock(state.mmproj_mtx);
-                    int32_t ret = mtmd_tokenize(state.shared_mmproj.ctx.get(), chunks_raw,
-                                                &txt, raw_bmps.data(), raw_bmps.size());
-                    if (ret != 0) { fail_fast("mtmd_tokenize_failed"); return; }
-                    // force_listen (accumulate): skip logits (cheaper).
-                    // trigger (decode follows): keep last-token logits for the sampler.
-                    const bool keep_logits = !parsed_input.force_listen;
-                    ret = mtmd_helper_eval_chunks(state.shared_mmproj.ctx.get(), sess.ctx,
-                                                  chunks_raw, new_n_past, 0, state.n_batch,
-                                                  /*logits_last*/keep_logits, &new_n_past);
-                    if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
-                }
-                sess.n_past = (int)new_n_past;
             }
 
-            // Keep KV within budget while streaming: slide the window when the
-            // accumulated stream (video frames + audio) would otherwise exhaust
-            // the context. Evicts the oldest tokens (after the system prompt),
-            // keeping the most recent stream content.
-            // NOTE: no sliding window during prefill. Sliding here discards the
-            // audio/video embedding tokens (keep=20 keeps only the system
-            // prompt), corrupting the context — the model then emits garbage
-            // (e.g. "xxxxx") and stops replying. Long audio should be bounded
-            // with --max-audio-s instead. decode-time sliding (inside
-            // generate_tokens_streaming) still applies as a last resort.
-
-            // ---- force_listen: prefill only, no decode ----
-            if (parsed_input.force_listen) {
-                ws.send(json_safe_dump(make_listen_delta(sid, rid, ProtocolMetrics{})));
-                continue;
+            // media bytes, in marker order: audio first, then frames
+            std::vector<raw_buffer> new_files;
+            if (has_audio_hd) {
+                auto pcm = b64_to_float32_pcm(parsed_input.audio_b64);
+                if (pcm.empty()) { fail_fast("invalid_audio"); return; }
+                new_files.push_back(build_wav_from_pcm(pcm));
+            }
+            for (const auto & frame_b64 : parsed_input.video_frames_b64) {
+                auto raw_img = b64_decode(frame_b64);
+                if (raw_img.empty()) { fail_fast("invalid_frame"); return; }
+                new_files.push_back(std::move(raw_img));
             }
 
-            // ---- Decode a full reply from current KV ----
-            sess.interrupt->store(false);
-            // Signal the model it's the assistant's turn to speak: eval the
-            // assistant marker BEFORE decoding. Without this the model sees a
-            // bare user turn and echoes it back instead of replying.
-            {
-                auto vocab_a = llama_model_get_vocab(state.shared_model.model);
-                auto asst_toks = common_tokenize(vocab_a, "<|im_start|>assistant\n", true, false);
-                if (!eval_tokens(sess.ctx, asst_toks, state.n_batch, &sess.n_past)) {
-                    fail_fast("eval_failed"); return;
-                }
+            if (user_text.empty()) {
+                // force_listen 且无媒体：无可累积，跳过。
+                // force_listen=false 且无媒体：纯文本 trigger（VAD 分句点）。
+                if (parsed_input.force_listen) { continue; }
+            } else {
+                sess.cumulative_prompt += user_text;
+                for (auto & f : new_files) { sess.cumulative_files.push_back(std::move(f)); }
             }
-            auto text = generate_tokens_streaming(sess.ctx, sess.smpl, sess.n_past, sess.n_ctx,
-                                                   sess.n_keep, max_new, eos_tok,
-                                                   sid, rid, ws, parsed_input.streaming,
-                                                   sess.interrupt.get());
-            // generate_tokens_streaming advances a local n_past; restore the
-            // authoritative position from the KV cache.
-            {
-                llama_memory_t mem = llama_get_memory(sess.ctx);
-                if (mem) {
-                    llama_pos used = llama_memory_seq_pos_max(mem, 0);
-                    if (used >= 0) { sess.n_past = (int)used + 1; }
-                }
-            }
-            // Ensure the assistant turn boundary for the next user chunk
-            {
-                auto vocab_a = llama_model_get_vocab(state.shared_model.model);
-                auto asst_toks = common_tokenize(vocab_a, "<|im_start|>assistant\n<|im_end|>\n", true, false);
-                if (!eval_tokens(sess.ctx, asst_toks, state.n_batch, &sess.n_past)) {
-                    fail_fast("eval_failed"); return;
-                }
-            }
-            ws.send(json_safe_dump(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{})));
 
-            // 每段回复完成后清理 KV，下一段从干净上下文开始。
-            // 否则多段 turn-based 对话的 KV 持续累积（音频+视频+回复），
-            // 超过 per-session n_ctx 后 "failed to find a memory slot"，
-            // 后续 prefill 失败、连接被关。
-            {
-                llama_memory_t mem = llama_get_memory(sess.ctx);
-                if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
+            // ---- Build the cumulative prompt for this task ----
+            std::string prompt = sess.cumulative_prompt;
+            if (!parsed_input.force_listen) {
+                // Trigger decode: mark the assistant turn.
+                prompt += "<|im_start|>assistant\n";
             }
-            sess.n_past = 0;
-            sess.n_keep = 0;
-            sess.system_prompt_initialized = false;  // 下段重新 prefill 系统 prompt
+
+            std::vector<raw_buffer> files = sess.cumulative_files; // copy
+
+            bool ok = run_omni_task(ws, state, sess, rid,
+                                    std::move(prompt), std::move(files),
+                                    /*force_listen*/ parsed_input.force_listen,
+                                    max_new, parsed_input.streaming);
+            if (!ok) {
+                // error already sent to the WS; close the session
+                return;
+            }
+
+            // After a completed reply turn, reset the KV so the next utterance
+            // starts from a clean context (same as the old full-KV reset fix).
+            if (!parsed_input.force_listen) {
+                sess.pending_reset = true;
+                sess.cumulative_prompt.clear();
+                sess.cumulative_files.clear();
+                sess.cumulative_prompt = sys_text;  // system prompt persists as the fresh prefix
+            }
             continue;
         }
 
+        // ====================================================================
+        // Turn-based path
+        // ====================================================================
         auto msgs = parse_messages_array(parsed_input.messages);
         if (msgs.empty()) { fail_fast("empty_messages"); return; }
 
@@ -841,33 +578,18 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
         const bool has_images = !last_user->image_b64s.empty();
         const bool has_audio  = !last_user->audio_b64s.empty();
         const bool has_video  = !last_user->video_b64s.empty();
-        const bool use_mmproj = !state.text_only && state.shared_mmproj.ctx != nullptr;
 
-        // Turn-based rebuilds the full prompt from the message history every
-        // input. Clear the KV cache first so positions restart cleanly from 0;
-        // otherwise the previous turn's tokens collide (decode: failed to
-        // initialize batch / eval_tokens: llama_decode failed at pos 0).
-        {
-            llama_memory_t mem = llama_get_memory(sess.ctx);
-            if (mem) { llama_memory_seq_rm(mem, 0, 0, -1); }
-        }
-
-        int n_past = 0;
-
-        if (use_mmproj && (has_images || has_audio || has_video)) {
-            // ======== MULTIMODAL PATH via mtmd ========
-
+        if (!state.text_only && (has_images || has_audio || has_video)) {
             // ---- Step 1: extract video frames + audio (if any) ----
             std::vector<std::string> video_frame_paths;
             std::string video_audio_path;
             if (has_video) {
-                const std::string temp_dir = (fs::temp_directory_path() / "qwen3omni_video").string();
+                // 每 session 唯一临时目录，避免并发 session 写同一 video_N/ 目录
+                // 导致帧文件互相覆盖/删除 → 图像 embedding 损坏 → 问号乱码。
+                const std::string temp_dir = (fs::temp_directory_path() / ("qwen3omni_video_" + sid)).string();
                 fs::create_directories(temp_dir);
-                thread_local int video_counter = 0;
-                ++video_counter;
                 for (const auto & vid_b64 : last_user->video_b64s) {
-                    auto vid = extract_video_mp4_media(vid_b64, temp_dir, video_counter,
-                                                       /*stack_frames*/2);
+                    auto vid = extract_video_mp4_media(vid_b64, temp_dir, 0, /*stack_frames*/2);
                     if (!vid.frame_paths.empty()) {
                         for (auto & fp : vid.frame_paths) {
                             video_frame_paths.push_back(std::move(fp));
@@ -880,64 +602,32 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 }
             }
 
-            // ---- Step 2: count total media items ----
-            int n_user_images = (int)last_user->image_b64s.size();
-            int n_video_frames = (int)video_frame_paths.size();
-            int n_total_audio = (int)last_user->audio_b64s.size()
-                              + (video_audio_path.empty() ? 0 : 1);
+            // ---- Step 2: count total media items + build files (marker order) ----
+            int n_user_images   = (int)last_user->image_b64s.size();
+            int n_video_frames  = (int)video_frame_paths.size();
+            int n_total_audio   = (int)last_user->audio_b64s.size()
+                                + (video_audio_path.empty() ? 0 : 1);
             int n_media = n_user_images + n_video_frames + n_total_audio;
 
             std::string prompt = build_qwen3_prompt(msgs, last_user, n_media);
 
-            // ---- Step 3: build bitmaps array ----
-            std::vector<mtmd::bitmap_ptr> owned_bmps;
-            std::vector<const mtmd_bitmap *> raw_bmps;
-            owned_bmps.reserve((size_t)n_media);
-            raw_bmps.reserve((size_t)n_media);
-
+            std::vector<raw_buffer> files;
             // Images first
             for (const auto & img_b64 : last_user->image_b64s) {
-                auto bmp = state.shared_mmproj.bitmap_from_image_b64(img_b64);
-                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                files.push_back(b64_decode(img_b64));
             }
             // Video frames (as images)
             for (const auto & fpath : video_frame_paths) {
-                auto bmp = state.shared_mmproj.bitmap_from_file(fpath);
-                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                files.push_back(read_file_bytes(fpath));
             }
             // User audio
             for (const auto & aud_b64 : last_user->audio_b64s) {
-                auto bmp = state.shared_mmproj.bitmap_from_audio_b64(aud_b64);
-                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                files.push_back(build_wav_from_pcm(b64_to_float32_pcm(aud_b64)));
             }
             // Video audio
             if (!video_audio_path.empty()) {
-                auto bmp = state.shared_mmproj.bitmap_from_file(video_audio_path);
-                if (bmp) { raw_bmps.push_back(bmp.get()); owned_bmps.push_back(std::move(bmp)); }
+                files.push_back(read_file_bytes(video_audio_path));
             }
-
-            // ---- Step 4: mtmd tokenize + eval (locked) ----
-            mtmd_input_chunks * chunks_raw = mtmd_input_chunks_init();
-            mtmd::input_chunks_ptr chunks(chunks_raw);
-
-            mtmd_input_text txt;
-            txt.text          = prompt.c_str();
-            txt.add_special   = true;
-            txt.parse_special = false;
-
-            llama_pos new_n_past = 0;
-            {
-                std::lock_guard<std::mutex> lock(state.mmproj_mtx);
-                int32_t ret = mtmd_tokenize(state.shared_mmproj.ctx.get(), chunks_raw,
-                                            &txt, raw_bmps.data(), raw_bmps.size());
-                if (ret != 0) { fail_fast("mtmd_tokenize_failed"); return; }
-
-                ret = mtmd_helper_eval_chunks(state.shared_mmproj.ctx.get(), sess.ctx,
-                                              chunks_raw, 0, 0, state.n_batch, true, &new_n_past);
-                if (ret != 0) { fail_fast("mtmd_eval_failed"); return; }
-            }
-            n_past = (int)new_n_past;
-            if (sess.n_keep == 0) { sess.n_keep = std::min(n_past, 512); }
 
             // Cleanup temp files (best-effort)
             if (has_video) {
@@ -945,29 +635,34 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 if (!video_audio_path.empty()) { fs::remove(video_audio_path); }
             }
 
-        } else {
-            // ======== TEXT PATH (with or without mmproj) ========
-            std::string prompt = build_qwen3_prompt(msgs, last_user, 0);
-            auto vocab = llama_model_get_vocab(state.shared_model.model);
-            auto toks = common_tokenize(vocab, prompt, true, false);
-            if (!eval_tokens(sess.ctx, toks, state.n_batch, &n_past)) {
-                fail_fast("eval_failed"); return;
-            }
-            if (sess.n_keep == 0) { sess.n_keep = std::min(n_past, 512); }
+            bool ok = run_omni_task(ws, state, sess, rid,
+                                    std::move(prompt), std::move(files),
+                                    /*force_listen*/ false,
+                                    max_new, parsed_input.streaming);
+            if (!ok) { return; }
+            // Turn-based: reset KV every turn (fresh context), matching the
+            // old per-session full-KV-reset behavior.
+            sess.pending_reset = true;
+            continue;
         }
 
-        // ---- Generate tokens (true streaming — deltas sent inline) ----
-        auto text = generate_tokens_streaming(sess.ctx, sess.smpl, n_past, sess.n_ctx, sess.n_keep,
-                                               max_new, eos_tok,
-                                               sid, rid, ws, parsed_input.streaming);
-
-        // Send response.done
-        ws.send(json_safe_dump(make_response_done(sid, rid, text, "", "turn_end", ProtocolMetrics{})));
+        // ---- Text-only path ----
+        std::string prompt = build_qwen3_prompt(msgs, last_user, 0);
+        bool ok = run_omni_task(ws, state, sess, rid,
+                                std::move(prompt), {},
+                                /*force_listen*/ false,
+                                max_new, parsed_input.streaming);
+        if (!ok) { return; }
+        sess.pending_reset = true;
     }
 
     // ---- Cleanup on disconnect ----
     LOG_INF("session %s disconnected\n", sid.c_str());
+    // 清理本 session 唯一的视频临时目录（session 结束后不再被任何并发 session 引用）。
+    std::error_code ec;
+    fs::remove_all((fs::temp_directory_path() / ("qwen3omni_video_" + sid)), ec);
     state.unregister_interrupt(sid);
+    state.free_slot(sid);
     ws.send(json_safe_dump(make_session_closed(sid, "client_disconnected")));
     state.mgr.close(sid);
 }
@@ -998,32 +693,9 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // Load text model
-    SharedModel shared_model;
-    if (!shared_model.load(params.model.path, params)) { llama_backend_free(); return 1; }
-
-    // Load mmproj (optional)
-    SharedMmproj shared_mmproj;
-    if (!text_only && !params.mmproj.path.empty()) {
-        int n_threads = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : 4;
-        if (!shared_mmproj.load(params.mmproj.path, shared_model.model,
-                                n_threads, params.mmproj_use_gpu))
-        {
-            LOG_WRN("mmproj load failed, falling back to text-only\n");
-        }
-    } else if (!text_only) {
-        LOG_INF("No --mmproj specified; text-only mode\n");
-    }
-
     int max_sessions = params.n_parallel > 0 ? params.n_parallel : 4;
-    int n_batch      = params.n_batch > 0 ? params.n_batch : 512;
-    // Total KV cache: from -c flag. Per-session = total / max_sessions.
-    int total_n_ctx = params.n_ctx;
-    if (total_n_ctx <= 0) {
-        total_n_ctx = 16384;
-    }
-    LOG_INF("Server: max_sessions=%d total_n_ctx=%d (per-session=%d)\n",
-            max_sessions, total_n_ctx, total_n_ctx / max_sessions);
+    LOG_INF("Server: max_sessions=%d total_n_ctx=%d (per-slot=%d)\n",
+            max_sessions, params.n_ctx, params.n_ctx / max_sessions);
 
     // HTTP server
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -1034,7 +706,39 @@ int main(int argc, char ** argv) {
     svr.set_read_timeout(params.timeout_read);
 
     SessionManager mgr(max_sessions);
-    ServerState state(shared_model, shared_mmproj, mgr, params.sampling, text_only, n_batch, max_sessions, total_n_ctx);
+    ServerState state(mgr, params, text_only);
+
+    // ---- Load model into the shared executor ----
+    // Neutralize settings that would break the half-duplex prefix-reuse design:
+    //  - cache_idle_slots clears a slot's KV after every task (kills accumulation)
+    //  - n_ctx_checkpoints adds mtmd-incompatible checkpoint machinery
+    if (!params.mmproj.path.empty() && text_only) {
+        // --text-only flag with --mmproj: ignore the mmproj
+        params.mmproj.path.clear();
+    }
+    params.cache_idle_slots = false;
+    params.n_ctx_checkpoints = 0;
+
+    // The executor initializes its mtmd_context with get_media_marker(), which is
+    // a RANDOM string per default. Our WS protocol uses the canonical <__media__>
+    // marker. Pin the env var so get_media_marker() returns exactly <__media__>.
+    if (getenv("LLAMA_MEDIA_MARKER") == nullptr) {
+        setenv("LLAMA_MEDIA_MARKER", "<__media__>", 0);
+    }
+
+    LOG_INF("loading model into shared batch executor...\n");
+    if (!state.ctx_server.load_model(params)) {
+        LOG_ERR("%s", "failed to load model\n");
+        llama_backend_free();
+        return 1;
+    }
+    LOG_INF("%s", "shared batch executor ready\n");
+
+    // Run the executor loop on a background thread.
+    std::atomic<bool> loop_stop{false};
+    std::thread executor_thread([&state]() {
+        state.ctx_server.start_loop();
+    });
 
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         json j = {{"status","ok"},{"engine","qwen3omni"},{"sessions",mgr.active_count()}};
@@ -1075,7 +779,6 @@ int main(int argc, char ** argv) {
     // Idle-session reaper: periodically close sessions inactive too long
     // (e.g. client WS died without a clean close). With max_sessions=1 a
     // single leaked session blocks all new connections.
-    // 300s: turn-based replies can be long; 60s reclaimed sessions mid-reply.
     const double idle_timeout_s = 300.0;
     std::atomic<bool> reaper_stop{false};
     std::thread reaper([&]() {
@@ -1094,9 +797,9 @@ int main(int argc, char ** argv) {
     LOG_INF("Shutting down\n");
     reaper_stop.store(true);
     if (reaper.joinable()) { reaper.join(); }
+    state.ctx_server.terminate();
+    if (executor_thread.joinable()) { executor_thread.join(); }
     mgr.shutdown();
-    shared_mmproj.ctx.reset();
-    shared_model.free();
     llama_backend_free();
     return 0;
 }

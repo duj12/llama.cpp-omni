@@ -1866,6 +1866,41 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_omni_stream
+//
+json server_task_result_omni_stream::to_json() {
+    json res = {
+        {"index", index},
+        {"event", [&]() {
+            switch (event) {
+                case Event::NONE:         return "none";
+                case Event::PREFILL_DONE: return "prefill_done";
+                case Event::TEXT_DELTA:   return "text_delta";
+                case Event::LISTEN:       return "listen";
+                case Event::DONE:         return "done";
+                case Event::ERROR:        return "error";
+            }
+            return "unknown";
+        }()},
+        {"n_decoded", n_decoded},
+    };
+    if (!text_delta.empty()) {
+        res["text_delta"] = text_delta;
+    }
+    if (!full_text.empty()) {
+        res["full_text"] = full_text;
+    }
+    if (!error.empty()) {
+        res["error"] = error;
+    }
+    // P3 音频增量预留（MiniCPM TTS）
+    if (!audio_pcm.empty()) {
+        res["audio_pcm_size"] = audio_pcm.size();
+    }
+    return res;
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {

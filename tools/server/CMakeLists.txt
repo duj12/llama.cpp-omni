@@ -123,7 +123,7 @@ add_executable(${TARGET_QWEN3OMNI}
 )
 install(TARGETS ${TARGET_QWEN3OMNI} RUNTIME)
 
-target_link_libraries(${TARGET_QWEN3OMNI} PRIVATE llama-common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET_QWEN3OMNI} PRIVATE server-context llama-common mtmd omni cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 if (LLAMA_OPENSSL AND OpenSSL_FOUND)
     target_link_libraries(${TARGET_QWEN3OMNI} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(${TARGET_QWEN3OMNI} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)

@@ -75,6 +75,10 @@ struct server_context {
     // get a new response reader, used by CLI application
     server_response_reader get_response_reader();
 
+    // post a task without waiting for results (e.g. SERVER_TASK_TYPE_CANCEL for barge-in)
+    // the task id is auto-assigned and returned
+    int post_task(server_task && task);
+
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;

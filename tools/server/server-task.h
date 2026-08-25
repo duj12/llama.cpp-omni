@@ -26,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_OMNI_STREAM, // 多模态流式（Qwen3/MiniCPM 半双工/全双工）
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -52,6 +53,11 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+
+    // 多模态流式（SERVER_TASK_TYPE_OMNI_STREAM）
+    bool force_listen = false;   // half-duplex：只累积 prefill 到 KV，不采样不回复
+    bool trigger_decode = false; // VAD+TurnSense 分句点：触发回复（生成直到 EOS/listen）
+    bool reset_kv = false;       // 任务启动前清空该 slot 的 KV（每轮 turn 后重置上下文）
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -190,6 +196,9 @@ struct server_task {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
                 return true;
+            case SERVER_TASK_TYPE_OMNI_STREAM:
+                // force_listen：只 prefill 不采样，跳过 logits（更省）
+                return !params.force_listen;
             default:
                 return false;
         }
@@ -200,6 +209,8 @@ struct server_task {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
                 return true;
+            case SERVER_TASK_TYPE_OMNI_STREAM:
+                return !params.force_listen;
             default:
                 return false;
         }
@@ -477,6 +488,33 @@ struct server_task_result_embd : server_task_result {
     json to_json_non_oaicompat();
 
     json to_json_oaicompat();
+};
+
+// 多模态流式结果（SERVER_TASK_TYPE_OMNI_STREAM）
+struct server_task_result_omni_stream : server_task_result {
+    enum class Event {
+        NONE,
+        PREFILL_DONE,   // force_listen 累积完成，无回复
+        TEXT_DELTA,     // 流式文本增量
+        LISTEN,         // 模型输出 <|listen|>（半双工回复结束 / 全双工切听）
+        DONE,           // 回复完成（response.done）
+        ERROR,
+    };
+    Event event = Event::NONE;
+
+    std::string text_delta;  // TEXT_DELTA 时的文本
+    std::string full_text;   // DONE 时的完整文本
+    int32_t n_decoded = 0;   // 已生成 token 数
+    std::string error;       // ERROR 时的消息
+
+    // 音频/全双工扩展（预留，P3 MiniCPM TTS 用）
+    std::vector<float> audio_pcm;  // 音频增量
+
+    virtual bool is_stop() override {
+        return event == Event::PREFILL_DONE || event == Event::DONE || event == Event::ERROR;
+    }
+
+    virtual json to_json() override;
 };
 
 struct server_task_result_rerank : server_task_result {

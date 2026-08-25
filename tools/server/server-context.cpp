@@ -1461,6 +1461,13 @@ private:
             return false;
         }
 
+        // 多模态流式：任务要求清空该 slot 的 KV（每轮 turn 结束后的上下文重置）。
+        // 必须在任务 prefill 之前清空，否则累积历史 token 会与 M-RoPE 位置冲突。
+        if (task.type == SERVER_TASK_TYPE_OMNI_STREAM && task.params.reset_kv) {
+            slot.prompt_clear(false);
+            SLT_INF(slot, "omni stream: KV reset before task, id_task = %d\n", task.id);
+        }
+
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         // initialize samplers
@@ -1735,6 +1742,20 @@ private:
     }
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
+        // 多模态流式：把每个采样 token 的文本增量作为 TEXT_DELTA 事件发给 WS 线程。
+        if (slot.task->type == SERVER_TASK_TYPE_OMNI_STREAM) {
+            if (is_progress) {
+                return; // 流式 omni 不需要进度事件
+            }
+            auto res = std::make_unique<server_task_result_omni_stream>();
+            res->id        = slot.task->id;
+            res->index     = slot.task->index;
+            res->event     = server_task_result_omni_stream::Event::TEXT_DELTA;
+            res->text_delta = tkn.text_to_send;
+            res->n_decoded = slot.n_decoded;
+            queue_results.send(std::move(res));
+            return;
+        }
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -1775,6 +1796,17 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // 多模态流式：回复结束发 DONE 事件（携带完整文本）。
+        if (slot.task->type == SERVER_TASK_TYPE_OMNI_STREAM) {
+            auto res = std::make_unique<server_task_result_omni_stream>();
+            res->id       = slot.task->id;
+            res->index    = slot.task->index;
+            res->event    = server_task_result_omni_stream::Event::DONE;
+            res->full_text = slot.generated_text;
+            res->n_decoded = slot.n_decoded;
+            queue_results.send(std::move(res));
+            return;
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2024,6 +2056,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_OMNI_STREAM:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2087,6 +2120,17 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            // 多模态流式：取消时发 DONE 事件解除 WS reader 阻塞
+                            // （barge-in 中断），携带已生成文本。
+                            if (slot.task->type == SERVER_TASK_TYPE_OMNI_STREAM) {
+                                auto res = std::make_unique<server_task_result_omni_stream>();
+                                res->id        = slot.task->id;
+                                res->index     = slot.task->index;
+                                res->event     = server_task_result_omni_stream::Event::DONE;
+                                res->full_text = slot.generated_text;
+                                res->n_decoded = slot.n_decoded;
+                                queue_results.send(std::move(res));
+                            }
                             slot.release();
                             break;
                         }
@@ -3270,6 +3314,22 @@ private:
                         continue; // continue loop of slots
                     }
 
+                    if (slot.task->type == SERVER_TASK_TYPE_OMNI_STREAM && slot.task->params.force_listen) {
+                        // 多模态流式 half-duplex：force_listen 只累积 prefill 到 KV，
+                        // 不进入生成。发 PREFILL_DONE 事件后释放 slot（KV 保留，供下一
+                        // 个 trigger task 前缀复用）。
+                        auto res = std::make_unique<server_task_result_omni_stream>();
+                        res->id       = slot.task->id;
+                        res->index    = slot.task->index;
+                        res->event    = server_task_result_omni_stream::Event::PREFILL_DONE;
+                        res->n_decoded = slot.n_decoded;
+                        queue_results.send(std::move(res));
+                        slot.print_timings();
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue; // continue loop of slots
+                    }
+
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
@@ -3457,6 +3517,13 @@ private:
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
+
+    int post_task(server_task && task) {
+        if (task.id == -1) {
+            task.id = queue_tasks.get_new_id();
+        }
+        return queue_tasks.post(std::move(task));
+    }
 };
 
 //
@@ -3485,6 +3552,10 @@ llama_context * server_context::get_llama_context() const {
 
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
+}
+
+int server_context::post_task(server_task && task) {
+    return impl->post_task(std::move(task));
 }
 
 server_context_meta server_context::get_meta() const {
