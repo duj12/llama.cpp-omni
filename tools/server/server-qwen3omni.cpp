@@ -223,6 +223,12 @@ struct Qwen3Session {
     int last_n_past = 0;                 // 最近一次 DONE 时该 slot 的 KV 已用 position 数（M-RoPE）
     int last_n_tokens = 0;               // 最近一次 DONE 时该 slot 的 prompt token 数（降级判断用）
     int slot_n_ctx = 0;                  // per-slot context size（KV 降级阈值判断）
+
+    // 是否跨分句累积历史上下文。默认 false：每轮只推理当前分句的音视频，
+    // 触发后清空 KV（只留 system prompt），输出更快（prompt 短）。
+    // 设为 true：累积历史（assistant 回复 + 之前轮次），跨分句有记忆，
+    // 但 prompt 变长、输出变慢，且 context 增长到阈值会周期性失忆。
+    bool accumulate_context = false;
 };
 
 // ============================================================================
@@ -478,8 +484,16 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     sess.half_duplex = (parsed_init.mode == "half_duplex" || parsed_init.mode == "full_duplex");
     state.register_interrupt(sid, sess.interrupt);
 
-    LOG_INF("session %s started (slot=%d, mode=%s, text_only=%d)\n",
-            sid.c_str(), sess.slot, parsed_init.mode.c_str(), (int) state.text_only);
+    // 跨分句累积历史上下文：默认关闭（每轮只推理当前分句，输出更快）。
+    // 客户端可在 session.init 的 config 里设 accumulate_context=true 启用累积。
+    if (parsed_init.config.contains("accumulate_context") &&
+        parsed_init.config["accumulate_context"].is_boolean()) {
+        sess.accumulate_context = parsed_init.config["accumulate_context"].get<bool>();
+    }
+
+    LOG_INF("session %s started (slot=%d, mode=%s, text_only=%d, accumulate=%d)\n",
+            sid.c_str(), sess.slot, parsed_init.mode.c_str(), (int) state.text_only,
+            (int) sess.accumulate_context);
 
     state.mgr.activate(sid, nullptr, false);
 
@@ -624,27 +638,37 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 return;
             }
 
-            // After a completed reply turn, KEEP the context for cross-turn memory.
-            // Append the assistant reply to the cumulative prompt so the next
-            // utterance sees the full history (prefix-reuse only evals new media).
+            // 触发回复完成后的上下文管理。
+            // - accumulate_context=false（默认）：每轮只推理当前分句，清空 KV
+            //   （只留 system prompt），输出更快（prompt 短），但无跨轮记忆。
+            // - accumulate_context=true：累积历史（assistant 回复 + 之前轮次），
+            //   跨分句有记忆，但 prompt 变长、输出变慢；接近 slot 上限时降级
+            //   （整段重建，周期性失忆）。
             if (!parsed_input.force_listen) {
-                if (!sess.last_reply.empty()) {
-                    sess.cumulative_prompt += "<|im_start|>assistant\n" + sess.last_reply + "<|im_end|>\n";
-                    sess.last_reply.clear();
-                }
-                // KV 接近 slot 上限时降级：reset + 从 system prompt 重建。
-                // M-RoPE 无法滑窗，只能整段重建；短对话不受影响（只在长对话
-                // context 快满时才牺牲历史，避免 "failed to find a memory slot")。
-                // 用 token 数（last_n_tokens）而非 M-RoPE position 数（last_n_past）：
-                // 媒体 chunk 占多 token 但少 pos，用 pos 判断会低估 KV 占用，
-                // 导致 context 实际耗尽报错（request exceeds available context size）。
-                if (sess.last_n_tokens > 0 && sess.slot_n_ctx > 0 &&
-                    sess.last_n_tokens >= sess.slot_n_ctx * 85 / 100) {
-                    LOG_INF("session %s: context budget nearly full (n_tokens=%d/slot_ctx=%d), degrading KV\n",
-                            sid.c_str(), sess.last_n_tokens, sess.slot_n_ctx);
+                if (sess.accumulate_context) {
+                    if (!sess.last_reply.empty()) {
+                        sess.cumulative_prompt += "<|im_start|>assistant\n" + sess.last_reply + "<|im_end|>\n";
+                        sess.last_reply.clear();
+                    }
+                    // KV 接近 slot 上限时降级：reset + 从 system prompt 重建。
+                    // M-RoPE 无法滑窗，只能整段重建。用 token 数（last_n_tokens）
+                    // 而非 M-RoPE position 数（last_n_past）：媒体 chunk 占多 token
+                    // 但少 pos，用 pos 判断会低估 KV 占用，导致 context 实际耗尽。
+                    if (sess.last_n_tokens > 0 && sess.slot_n_ctx > 0 &&
+                        sess.last_n_tokens >= sess.slot_n_ctx * 85 / 100) {
+                        LOG_INF("session %s: context budget nearly full (n_tokens=%d/slot_ctx=%d), degrading KV\n",
+                                sid.c_str(), sess.last_n_tokens, sess.slot_n_ctx);
+                        sess.pending_reset = true;
+                        sess.cumulative_prompt = sys_text;  // 只保留 system prompt 作为新前缀
+                        sess.cumulative_files.clear();
+                    }
+                } else {
+                    // 不累积：每轮结束后清空 KV，下一轮从 system prompt 重新累积
+                    // 当前分句的音视频。防止 prompt 无限增长导致输出变慢。
                     sess.pending_reset = true;
-                    sess.cumulative_prompt = sys_text;  // 只保留 system prompt 作为新前缀
+                    sess.cumulative_prompt = sys_text;
                     sess.cumulative_files.clear();
+                    sess.last_reply.clear();
                 }
             }
             continue;
