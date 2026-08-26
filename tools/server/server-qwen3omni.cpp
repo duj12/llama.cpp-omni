@@ -220,7 +220,8 @@ struct Qwen3Session {
     bool pending_reset = true;           // next task clears the slot KV (start of a fresh turn)
 
     std::string last_reply;              // 最近一次 DONE 的完整回复文本（用于累积进上下文）
-    int last_n_past = 0;                 // 最近一次 DONE 时该 slot 的 KV 已用 position 数
+    int last_n_past = 0;                 // 最近一次 DONE 时该 slot 的 KV 已用 position 数（M-RoPE）
+    int last_n_tokens = 0;               // 最近一次 DONE 时该 slot 的 prompt token 数（降级判断用）
     int slot_n_ctx = 0;                  // per-slot context size（KV 降级阈值判断）
 };
 
@@ -356,6 +357,12 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
                           std::string prompt, std::vector<raw_buffer> files,
                           bool force_listen, int max_new, bool streaming)
 {
+    // 每次任务开始前复位 barge-in 标志。若上次任务被中断（worker 的 interrupt()
+    // 设置了 sess.interrupt），不复位会导致本 session 之后所有任务在
+    // server_response_reader::next 的 should_stop 恒为 true → 每个任务立即中断
+    // （"task interrupted"），连接最终被服务端关闭（ConnectionClosedOK 1000）。
+    sess.interrupt->store(false);
+
     server_task task(SERVER_TASK_TYPE_OMNI_STREAM);
     task.id_slot   = sess.slot;
     task.cli       = true;
@@ -400,8 +407,10 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
                 break;
             case server_task_result_omni_stream::Event::DONE:
                 // 记录本轮回复 + KV 占用，供累积式上下文的跨分句记忆与降级判断。
-                sess.last_reply   = omni->full_text;
-                sess.last_n_past  = omni->n_past;
+                // n_tokens（prompt token 数）比 n_past（M-RoPE pos）更接近实际 KV 用量。
+                sess.last_reply    = omni->full_text;
+                sess.last_n_past   = omni->n_past;
+                sess.last_n_tokens = omni->n_tokens;
                 ws.send(json_safe_dump(make_response_done(sess.sid, rid, omni->full_text, "", "turn_end", ProtocolMetrics{})));
                 done = true;
                 break;
@@ -626,12 +635,13 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 // KV 接近 slot 上限时降级：reset + 从 system prompt 重建。
                 // M-RoPE 无法滑窗，只能整段重建；短对话不受影响（只在长对话
                 // context 快满时才牺牲历史，避免 "failed to find a memory slot")。
-                // 用比例阈值（85%）而非固定值，兼容小 slot_ctx（如 -c 16384/np10
-                // → slot_ctx=1792 时固定 2048 余量会是负数，导致每次触发都误降级）。
-                if (sess.last_n_past > 0 && sess.slot_n_ctx > 0 &&
-                    sess.last_n_past >= sess.slot_n_ctx * 85 / 100) {
-                    LOG_INF("session %s: context budget nearly full (n_past=%d/slot_ctx=%d), degrading KV\n",
-                            sid.c_str(), sess.last_n_past, sess.slot_n_ctx);
+                // 用 token 数（last_n_tokens）而非 M-RoPE position 数（last_n_past）：
+                // 媒体 chunk 占多 token 但少 pos，用 pos 判断会低估 KV 占用，
+                // 导致 context 实际耗尽报错（request exceeds available context size）。
+                if (sess.last_n_tokens > 0 && sess.slot_n_ctx > 0 &&
+                    sess.last_n_tokens >= sess.slot_n_ctx * 85 / 100) {
+                    LOG_INF("session %s: context budget nearly full (n_tokens=%d/slot_ctx=%d), degrading KV\n",
+                            sid.c_str(), sess.last_n_tokens, sess.slot_n_ctx);
                     sess.pending_reset = true;
                     sess.cumulative_prompt = sys_text;  // 只保留 system prompt 作为新前缀
                     sess.cumulative_files.clear();

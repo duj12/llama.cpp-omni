@@ -1804,10 +1804,12 @@ private:
             res->event    = server_task_result_omni_stream::Event::DONE;
             res->full_text = slot.generated_text;
             res->n_decoded = slot.n_decoded;
-            // KV 已用 position 数（M-RoPE 模型用 pos，不用 token 数）。
-            // 供 WS 侧判断该 session 的累积上下文是否接近 slot 上限，
-            // 以便在 context 耗尽前主动降级（reset + 重建）。
-            res->n_past = slot.prompt.tokens.pos_next();
+            // KV 占用：token 数（slot.prompt.n_tokens 含媒体占位 token）比 position
+            // 数更接近实际的 context 用量——M-RoPE 媒体 chunk 占多 token 但少 pos，
+            // 用 pos 判断降级会低估 KV 占用，导致 context 耗尽报错。
+            // 供 WS 侧判断该 session 的累积上下文是否接近 slot 上限，以便降级。
+            res->n_past   = slot.prompt.tokens.pos_next();
+            res->n_tokens = (int) slot.prompt.tokens.size();
             queue_results.send(std::move(res));
             return;
         }
