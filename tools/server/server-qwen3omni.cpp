@@ -44,6 +44,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <map>
+#include <set>
 #include <thread>
 
 #define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH (128 * 1024 * 1024)
@@ -212,9 +213,15 @@ struct Qwen3Session {
     // half-duplex: cumulative prompt text + media bytes so far (for this turn).
     // Each force_listen task carries the full cumulative prompt so the shared
     // executor's prefix-reuse (chunk-hash) only evals the newly added media.
+    // 累积式上下文：回复后不清空，把 assistant 回复也追加进累积 prompt，
+    // 下一句靠 executor 前缀复用看到完整历史（跨分句记忆）。
     std::string cumulative_prompt;
     std::vector<raw_buffer> cumulative_files;
     bool pending_reset = true;           // next task clears the slot KV (start of a fresh turn)
+
+    std::string last_reply;              // 最近一次 DONE 的完整回复文本（用于累积进上下文）
+    int last_n_past = 0;                 // 最近一次 DONE 时该 slot 的 KV 已用 position 数
+    int slot_n_ctx = 0;                  // per-slot context size（KV 降级阈值判断）
 };
 
 // ============================================================================
@@ -257,17 +264,22 @@ struct ServerState {
     }
 
     // Allocate a stable slot for a session. Returns -1 if all slots are taken.
+    // Uses the first unoccupied slot (not size()), so a slot freed by a previous
+    // session is correctly reused even if session_slots still holds stale entries.
     int alloc_slot(const std::string & sid) {
         std::lock_guard<std::mutex> lock(slot_mtx);
         if (session_slots.find(sid) != session_slots.end()) {
             return session_slots[sid];
         }
-        if ((int) session_slots.size() >= max_sessions) {
-            return -1;
+        std::set<int> used;
+        for (const auto & [_, s] : session_slots) { used.insert(s); }
+        for (int i = 0; i < max_sessions; i++) {
+            if (used.find(i) == used.end()) {
+                session_slots[sid] = i;
+                return i;
+            }
         }
-        int slot = (int) session_slots.size();
-        session_slots[sid] = slot;
-        return slot;
+        return -1;
     }
 
     void free_slot(const std::string & sid) {
@@ -387,6 +399,9 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
                 ws.send(json_safe_dump(make_text_delta(sess.sid, rid, omni->text_delta, ProtocolMetrics{})));
                 break;
             case server_task_result_omni_stream::Event::DONE:
+                // 记录本轮回复 + KV 占用，供累积式上下文的跨分句记忆与降级判断。
+                sess.last_reply   = omni->full_text;
+                sess.last_n_past  = omni->n_past;
                 ws.send(json_safe_dump(make_response_done(sess.sid, rid, omni->full_text, "", "turn_end", ProtocolMetrics{})));
                 done = true;
                 break;
@@ -414,7 +429,11 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
 
 static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
     std::string sid = state.mgr.allocate();
-    if (sid.empty()) { ws.close(); return; }
+    if (sid.empty()) {
+        LOG_WRN("session allocation rejected: max_sessions=%d reached (all sessions busy)\n", state.max_sessions);
+        ws.close();
+        return;
+    }
     state.mgr.set_close_callback(sid, [&ws]() { ws.close(); });
 
     Qwen3Session sess;
@@ -454,6 +473,24 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             sid.c_str(), sess.slot, parsed_init.mode.c_str(), (int) state.text_only);
 
     state.mgr.activate(sid, nullptr, false);
+
+    // per-slot context 大小（用于累积式上下文降级阈值判断）。
+    sess.slot_n_ctx = state.ctx_server.get_meta().slot_n_ctx;
+    if (sess.slot_n_ctx <= 0) { sess.slot_n_ctx = 8192; }  // fallback
+
+    // 关键修复：slot 释放绑定到 SessionManager::close 的 cleanup_fn。
+    // reaper（reap_idle → close）或 /sessions/:id/close API 关闭 session 时，
+    // handle_ws 的 ws.read() 仍可能阻塞（full_duplex 长连接），cleanup 里的
+    // free_slot 不会执行 → session_slots 泄漏、新连接 no free executor slot。
+    // cleanup_fn 在 SessionManager::close 的锁外调用，这里把 slot 释放挂上去，
+    // 任何关闭路径都会同步释放 slot（free_slot 幂等，与 cleanup 重复调用安全）。
+    if (auto * osess = state.mgr.get(sid)) {
+        osess->cleanup_fn = [&state, sid]() {
+            state.free_slot(sid);
+            state.unregister_interrupt(sid);
+        };
+    }
+
     ws.send(json_safe_dump(make_session_created(sid, parsed_init.mode)));
 
     // System prompt block, prefilled once per turn (included in every
@@ -552,13 +589,27 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 return;
             }
 
-            // After a completed reply turn, reset the KV so the next utterance
-            // starts from a clean context (same as the old full-KV reset fix).
+            // After a completed reply turn, KEEP the context for cross-turn memory.
+            // Append the assistant reply to the cumulative prompt so the next
+            // utterance sees the full history (prefix-reuse only evals new media).
             if (!parsed_input.force_listen) {
-                sess.pending_reset = true;
-                sess.cumulative_prompt.clear();
-                sess.cumulative_files.clear();
-                sess.cumulative_prompt = sys_text;  // system prompt persists as the fresh prefix
+                if (!sess.last_reply.empty()) {
+                    sess.cumulative_prompt += "<|im_start|>assistant\n" + sess.last_reply + "<|im_end|>\n";
+                    sess.last_reply.clear();
+                }
+                // KV 接近 slot 上限时降级：reset + 从 system prompt 重建。
+                // M-RoPE 无法滑窗，只能整段重建；短对话不受影响（只在长对话
+                // context 快满时才牺牲历史，避免 "failed to find a memory slot")。
+                // 用比例阈值（85%）而非固定值，兼容小 slot_ctx（如 -c 16384/np10
+                // → slot_ctx=1792 时固定 2048 余量会是负数，导致每次触发都误降级）。
+                if (sess.last_n_past > 0 && sess.slot_n_ctx > 0 &&
+                    sess.last_n_past >= sess.slot_n_ctx * 85 / 100) {
+                    LOG_INF("session %s: context budget nearly full (n_past=%d/slot_ctx=%d), degrading KV\n",
+                            sid.c_str(), sess.last_n_past, sess.slot_n_ctx);
+                    sess.pending_reset = true;
+                    sess.cumulative_prompt = sys_text;  // 只保留 system prompt 作为新前缀
+                    sess.cumulative_files.clear();
+                }
             }
             continue;
         }

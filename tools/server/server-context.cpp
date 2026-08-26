@@ -1804,6 +1804,10 @@ private:
             res->event    = server_task_result_omni_stream::Event::DONE;
             res->full_text = slot.generated_text;
             res->n_decoded = slot.n_decoded;
+            // KV 已用 position 数（M-RoPE 模型用 pos，不用 token 数）。
+            // 供 WS 侧判断该 session 的累积上下文是否接近 slot 上限，
+            // 以便在 context 耗尽前主动降级（reset + 重建）。
+            res->n_past = slot.prompt.tokens.pos_next();
             queue_results.send(std::move(res));
             return;
         }

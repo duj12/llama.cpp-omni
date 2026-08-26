@@ -505,6 +505,7 @@ struct server_task_result_omni_stream : server_task_result {
     std::string text_delta;  // TEXT_DELTA 时的文本
     std::string full_text;   // DONE 时的完整文本
     int32_t n_decoded = 0;   // 已生成 token 数
+    int32_t n_past = 0;      // DONE 时该 slot 的 KV 已用 position 数（WS 侧判断是否需降级 reset）
     std::string error;       // ERROR 时的消息
 
     // 音频/全双工扩展（预留，P3 MiniCPM TTS 用）
