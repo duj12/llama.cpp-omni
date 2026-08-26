@@ -562,7 +562,13 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 new_files.push_back(std::move(raw_img));
             }
 
-            if (user_text.empty()) {
+            // force_reply=true：worker 的触发信号（VAD+TurnSense 判定用户说完），
+            // 其附带的是静音块，不是用户真实输入——绝不能累积进 context，
+            // 否则每轮触发都会累积一个相同的静音音频块，多轮后 context 被
+            // 静音淹没、模型回复趋同（"每轮回复一样"）。直接触发解码。
+            if (parsed_input.force_reply) {
+                // 触发信号：跳过累积，直接走触发解码
+            } else if (user_text.empty()) {
                 // force_listen 且无媒体：无可累积，跳过。
                 // force_listen=false 且无媒体：纯文本 trigger（VAD 分句点）。
                 if (parsed_input.force_listen) { continue; }
@@ -579,6 +585,14 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             }
 
             std::vector<raw_buffer> files = sess.cumulative_files; // copy
+
+            // TEMP DEBUG: print the cumulative prompt + media count each task
+            {
+                std::string dbg = prompt;
+                if (dbg.size() > 300) { dbg = dbg.substr(0, 300) + "..."; }
+                LOG_INF("omni_dbg session=%s force_listen=%d prompt=[%s] n_files=%zu\n",
+                        sid.c_str(), (int)parsed_input.force_listen, dbg.c_str(), files.size());
+            }
 
             bool ok = run_omni_task(ws, state, sess, rid,
                                     std::move(prompt), std::move(files),
