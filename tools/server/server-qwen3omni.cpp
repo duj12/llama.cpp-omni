@@ -548,7 +548,9 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
         if (!parsed_input.ok) { fail_fast("invalid_input"); return; }
 
         std::string rid = sid + "-" + std::to_string(++sess.resp_cnt);
-        int max_new = parsed_input.max_new_tokens > 0 ? parsed_input.max_new_tokens : 512;
+        // 长回复（视频理解/多轮总结常超 512 token）会被截断，默认调大到 1024。
+        // 客户端可通过 input.append 的 max_new_tokens 覆盖。
+        int max_new = parsed_input.max_new_tokens > 0 ? parsed_input.max_new_tokens : 1024;
 
         // ====================================================================
         // Half-duplex / full-duplex streaming path (VAD+TurnSense worker-driven)
