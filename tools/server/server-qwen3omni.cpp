@@ -570,11 +570,31 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
                 // 触发信号：跳过累积，直接走触发解码
             } else if (user_text.empty()) {
                 // force_listen 且无媒体：无可累积，跳过。
-                // force_listen=false 且无媒体：纯文本 trigger（VAD 分句点）。
+                // force_listen=false 且无媒体：可能是纯文本 trigger 或带 messages 的文本问题。
                 if (parsed_input.force_listen) { continue; }
             } else {
                 sess.cumulative_prompt += user_text;
                 for (auto & f : new_files) { sess.cumulative_files.push_back(std::move(f)); }
+            }
+
+            // half-duplex 下的纯文本 user turn：input.append 带 messages 时，
+            // 把最后一条 user 消息的文本追加为新的 user turn（累积式上下文的
+            // 文本部分）。否则纯文本问题会被丢弃，模型看不到用户问了什么，
+            // 只能看到 system + 历史媒体 → 回复答非所问或趋同。
+            if (!parsed_input.messages.is_null()) {
+                auto msgs_txt = parse_messages_array(parsed_input.messages);
+                const ParsedMessage * last_user_txt = nullptr;
+                for (auto it = msgs_txt.rbegin(); it != msgs_txt.rend(); ++it) {
+                    if (it->role == "user" && !it->text.empty()) {
+                        last_user_txt = &(*it);
+                        break;
+                    }
+                }
+                if (last_user_txt) {
+                    // 若当前 input 已累积了媒体 user turn（user_text 非空），文本
+                    // 单独成一个 user turn，避免与媒体 marker 混在一起。
+                    sess.cumulative_prompt += "<|im_start|>user\n" + last_user_txt->text + "<|im_end|>\n";
+                }
             }
 
             // ---- Build the cumulative prompt for this task ----
@@ -585,14 +605,6 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
             }
 
             std::vector<raw_buffer> files = sess.cumulative_files; // copy
-
-            // TEMP DEBUG: print the cumulative prompt + media count each task
-            {
-                std::string dbg = prompt;
-                if (dbg.size() > 300) { dbg = dbg.substr(0, 300) + "..."; }
-                LOG_INF("omni_dbg session=%s force_listen=%d prompt=[%s] n_files=%zu\n",
-                        sid.c_str(), (int)parsed_input.force_listen, dbg.c_str(), files.size());
-            }
 
             bool ok = run_omni_task(ws, state, sess, rid,
                                     std::move(prompt), std::move(files),
