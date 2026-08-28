@@ -631,11 +631,6 @@ static void handle_ws(httplib::ws::WebSocket & ws, ServerState & state) {
 
             std::vector<raw_buffer> files = sess.cumulative_files; // copy
 
-            // [TEMP-DIAG] 每次 run_omni_task 打印 session/触发类型/媒体数，对比短视频 vs 长视频 2 路
-            LOG_INF("[DIAG] session %s run_omni_task: force_listen=%d force_reply=%d files=%zu cumulative_prompt_len=%zu\n",
-                    sess.sid.c_str(), (int) parsed_input.force_listen, (int) parsed_input.force_reply,
-                    files.size(), sess.cumulative_prompt.size());
-
             bool ok = run_omni_task(ws, state, sess, rid,
                                     std::move(prompt), std::move(files),
                                     /*force_listen*/ parsed_input.force_listen,
