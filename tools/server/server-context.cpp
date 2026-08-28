@@ -3158,9 +3158,16 @@ private:
                 batch.logits   + i,
             };
 
+            const int64_t t_decode_start = ggml_time_ms();
             const int ret = llama_decode(ctx_tgt, batch_view);
+            const int64_t t_decode_ms = ggml_time_ms() - t_decode_start;
 
             metrics.on_decoded(slots);
+
+            if (t_decode_ms > 30000) {
+                SRV_WRN("llama_decode took %" PRId64 " ms (n_tokens=%d, slot=%d, seq0=%d), possible multi-modal batch hang\n",
+                        t_decode_ms, n_tokens, i / n_tokens, batch.n_seq_id ? batch.n_seq_id[i] : -1);
+            }
 
             if (ret != 0) {
                 {
