@@ -504,6 +504,7 @@ struct server_task_result_omni_stream : server_task_result {
 
     std::string text_delta;  // TEXT_DELTA 时的文本
     std::string full_text;   // DONE 时的完整文本
+    float prob = 0.0f;       // TEXT_DELTA: 采中 token 的 top-1 概率 (0~1, n_probs>0 有效)
     int32_t n_decoded = 0;   // 已生成 token 数
     int32_t n_past = 0;      // DONE 时该 slot 的 KV 已用 position 数（M-RoPE）
     int32_t n_tokens = 0;    // DONE 时该 slot 的 prompt token 数（含媒体占位，接近 KV 实际用量）

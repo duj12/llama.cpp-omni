@@ -1752,6 +1752,7 @@ private:
             res->index     = slot.task->index;
             res->event     = server_task_result_omni_stream::Event::TEXT_DELTA;
             res->text_delta = tkn.text_to_send;
+            res->prob      = tkn.prob;   // 采中 token 的 top-1 概率（n_probs>0 有效）
             res->n_decoded = slot.n_decoded;
             queue_results.send(std::move(res));
             return;

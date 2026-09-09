@@ -382,6 +382,13 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
     task.params.force_listen  = force_listen;
     task.params.reset_kv      = sess.pending_reset;
     sess.pending_reset        = false;
+    // 需要每个 token 的 top-1 概率（置信度）：n_probs>=1 才触发 populate_token_probs 填 prob。
+    // 只需 top-1，设 1 省算力；post_sampling_probs=true 走 sampler candidates 高效路径
+    //（避免 populate 里 get_token_probabilities 重新 forward 算 logits）。
+    if (task.params.sampling.n_probs < 1) {
+        task.params.sampling.n_probs = 1;
+    }
+    task.params.post_sampling_probs = true;
 
     server_response_reader rd = state.ctx_server.get_response_reader();
     task.id = rd.get_new_id();                     // required: queue.post() asserts id != -1
@@ -409,7 +416,14 @@ static bool run_omni_task(httplib::ws::WebSocket & ws, ServerState & state,
                 break;
             case server_task_result_omni_stream::Event::TEXT_DELTA:
                 partial_text += omni->text_delta;
-                ws.send(json_safe_dump(make_text_delta(sess.sid, rid, omni->text_delta, ProtocolMetrics{})));
+                {
+                    auto ev = make_text_delta(sess.sid, rid, omni->text_delta, ProtocolMetrics{});
+                    // 附上采中 token 的 top-1 概率 (0~1)，供客户端算整句置信度。
+                    if (omni->prob > 0.0f) {
+                        ev["prob"] = omni->prob;
+                    }
+                    ws.send(json_safe_dump(ev));
+                }
                 break;
             case server_task_result_omni_stream::Event::DONE:
                 // 记录本轮回复 + KV 占用，供累积式上下文的跨分句记忆与降级判断。
